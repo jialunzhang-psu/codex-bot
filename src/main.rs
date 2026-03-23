@@ -11,8 +11,10 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use tokio::process::Command;
-use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing::{error, info, warn};
+use tracing_subscriber::{
+    EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt,
+};
 
 use crate::app::BridgeApp;
 use crate::codex::CodexClient;
@@ -30,10 +32,20 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let log_handle = init_tracing("info");
+    if let Err(err) = run(log_handle).await {
+        error!(error = %err, "bridge exited with error");
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn run(log_handle: reload::Handle<EnvFilter, Registry>) -> Result<()> {
     let args = Args::parse();
+    info!(config = %args.config.display(), "starting codex telegram bridge");
+
     let discovered_projects = Config::discover_projects(&args.config)?;
     if args.project.is_none() && discovered_projects.len() > 1 {
-        init_tracing("info");
         info!(
             count = discovered_projects.len(),
             "starting supervisor mode for multi-project cc-connect config"
@@ -42,11 +54,16 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::load(&args.config, args.project.as_deref())?;
-    init_tracing(&config.log_level);
+    reload_log_level(&log_handle, &config.log_level);
 
     if let Some(project_name) = &config.project_name {
         info!(project = %project_name, "loaded project from cc-connect config");
     }
+    info!(
+        work_dir = %config.codex.work_dir.display(),
+        log_level = %config.log_level,
+        "configuration loaded"
+    );
 
     let state_path = config.default_state_path(&args.config);
     let telegram = TelegramClient::new(config.telegram.token.clone())?;
@@ -55,19 +72,35 @@ async fn main() -> Result<()> {
         state_path,
         config.default_runtime_settings(),
     )?);
+    info!("fetching Telegram bot identity");
     let app = BridgeApp::new(config, telegram, state, codex).await?;
     app.run().await
 }
 
-fn init_tracing(default_level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(default_level.to_string())),
+fn init_tracing(default_level: &str) -> reload::Handle<EnvFilter, Registry> {
+    let (filter_layer, handle) = reload::Layer::new(build_env_filter(default_level));
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_target(false)
+                .compact(),
         )
-        .with_target(false)
-        .compact()
         .init();
+    handle
+}
+
+fn reload_log_level(handle: &reload::Handle<EnvFilter, Registry>, default_level: &str) {
+    if std::env::var_os("RUST_LOG").is_some() {
+        return;
+    }
+
+    let _ = handle.reload(build_env_filter(default_level));
+}
+
+fn build_env_filter(default_level: &str) -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level.to_string()))
 }
 
 async fn run_supervisor(config_path: PathBuf, projects: Vec<String>) -> Result<()> {

@@ -50,6 +50,15 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn normalize_log_level(level: impl Into<String>) -> String {
+    let level = level.into();
+    if level.trim().is_empty() {
+        default_log_level()
+    } else {
+        level
+    }
+}
+
 fn default_poll_timeout_seconds() -> u64 {
     30
 }
@@ -109,6 +118,7 @@ impl Config {
         if let Some(state_path) = &config.state_path {
             config.state_path = Some(normalize_path(path.parent(), state_path));
         }
+        config.log_level = normalize_log_level(config.log_level);
 
         Ok(config)
     }
@@ -203,10 +213,9 @@ impl Config {
                 extra_env: project.agent.options.extra_env.clone(),
             },
             state_path,
-            log_level: legacy
-                .log
-                .and_then(|log| log.level)
-                .unwrap_or_else(default_log_level),
+            log_level: normalize_log_level(
+                legacy.log.and_then(|log| log.level).unwrap_or_default(),
+            ),
         })
     }
 }
@@ -335,4 +344,67 @@ enum AllowFromValue {
     Single(i64),
     List(Vec<i64>),
     Csv(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::Config;
+
+    #[test]
+    fn load_native_config_normalizes_empty_log_level() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+log_level = ""
+
+[telegram]
+token = "123"
+
+[codex]
+work_dir = "./work"
+"#,
+        )
+        .expect("write config");
+
+        let config = Config::load(&config_path, None).expect("load config");
+        assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn load_legacy_config_normalizes_empty_log_level() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[projects]]
+name = "demo"
+
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "./work"
+
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+token = "123"
+
+[log]
+level = ""
+"#,
+        )
+        .expect("write config");
+
+        let config = Config::load(&config_path, None).expect("load config");
+        assert_eq!(config.log_level, "info");
+    }
 }
