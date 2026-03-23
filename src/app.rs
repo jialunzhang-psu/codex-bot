@@ -437,8 +437,17 @@ impl BridgeApp {
             };
             let display = session_display_name(session, &names);
             let modified = format_time(session.modified_at);
+            let prompt = session.summary.trim();
+            let prompt_suffix = if prompt.is_empty()
+                || display.contains(prompt)
+                || prompt.contains(display.as_str())
+            {
+                String::new()
+            } else {
+                format!(" prompt={prompt}")
+            };
             lines.push(format!(
-                "{marker} {absolute_index}. {display} [{id}] msgs={msgs} updated={modified}",
+                "{marker} {absolute_index}. {display} [{id}] msgs={msgs} updated={modified}{prompt_suffix}",
                 id = short_id(&session.id),
                 msgs = session.message_count
             ));
@@ -1242,6 +1251,12 @@ fn session_display_name(session: &SessionSummary, names: &HashMap<String, String
         .get(&session.id)
         .cloned()
         .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            session
+                .display_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+        })
         .or_else(|| (!session.summary.trim().is_empty()).then(|| session.summary.clone()))
         .unwrap_or_else(|| "(empty)".to_string())
 }
@@ -1263,10 +1278,8 @@ fn match_session<'a>(
     }
 
     for session in sessions {
-        if names
-            .get(&session.id)
-            .is_some_and(|name| name.eq_ignore_ascii_case(&query_lower))
-        {
+        let display = session_display_name(session, names);
+        if display.eq_ignore_ascii_case(query.trim()) {
             return Some(session);
         }
     }
@@ -1278,10 +1291,15 @@ fn match_session<'a>(
     }
 
     for session in sessions {
-        if names
-            .get(&session.id)
-            .is_some_and(|name| name.to_ascii_lowercase().starts_with(&query_lower))
-        {
+        let display = session_display_name(session, names);
+        if display.to_ascii_lowercase().starts_with(&query_lower) {
+            return Some(session);
+        }
+    }
+
+    for session in sessions {
+        let display = session_display_name(session, names);
+        if display.to_ascii_lowercase().contains(&query_lower) {
             return Some(session);
         }
     }

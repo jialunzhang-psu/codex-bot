@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -38,6 +39,7 @@ pub struct RuntimeSettings {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
+    pub display_name: Option<String>,
     pub summary: String,
     pub message_count: usize,
     pub modified_at: SystemTime,
@@ -989,6 +991,7 @@ fn extract_tool_input(item: &Map<String, Value>) -> String {
 
 fn list_sessions_in(work_dir: &Path, codex_home: &Path) -> Result<Vec<SessionSummary>> {
     let work_dir = normalize_path(work_dir)?;
+    let store = CodexStore::from_home(codex_home.to_path_buf())?;
     let sessions_dir = sessions_root_in(codex_home);
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -1001,6 +1004,19 @@ fn list_sessions_in(work_dir: &Path, codex_home: &Path) -> Result<Vec<SessionSum
         .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .filter_map(|entry| parse_session_file(entry.path(), &work_dir).transpose())
         .collect::<Result<Vec<_>>>()?;
+
+    let indexed_names = load_indexed_session_names(&store.session_index_path)?;
+    let state_titles = load_state_thread_titles(store.state_db_path.as_deref())?;
+    let history_names = load_history_session_names(&store.history_path)?;
+    for session in &mut sessions {
+        let derived_name = session.display_name.clone();
+        session.display_name = indexed_names
+            .get(&session.id)
+            .cloned()
+            .or_else(|| state_titles.get(&session.id).cloned())
+            .or(derived_name)
+            .or_else(|| history_names.get(&session.id).cloned());
+    }
 
     sessions.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
     Ok(sessions)
@@ -1106,6 +1122,7 @@ fn parse_session_file(path: &Path, filter_cwd: &Path) -> Result<Option<SessionSu
         .with_context(|| format!("failed to stat {}", path.display()))?;
     let mut session_id = None;
     let mut session_cwd = None;
+    let mut display_name = None;
     let mut summary = String::new();
     let mut message_count = 0usize;
 
@@ -1143,7 +1160,11 @@ fn parse_session_file(path: &Path, filter_cwd: &Path) -> Result<Option<SessionSu
                                 && !content.text.trim().is_empty()
                                 && is_user_prompt(&content.text)
                             {
-                                summary = content.text;
+                                if display_name.is_none() {
+                                    display_name = derived_session_name_from_text(&content.text);
+                                }
+                                summary =
+                                    session_summary_from_text(&content.text).unwrap_or_default();
                             }
                         }
                     } else if item.role.as_deref() == Some("assistant") {
@@ -1167,16 +1188,103 @@ fn parse_session_file(path: &Path, filter_cwd: &Path) -> Result<Option<SessionSu
         }
     }
 
-    if summary.chars().count() > 60 {
-        summary = summary.chars().take(60).collect::<String>() + "...";
-    }
-
     Ok(Some(SessionSummary {
         id: session_id,
+        display_name,
         summary,
         message_count,
         modified_at: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
     }))
+}
+
+fn load_indexed_session_names(path: &Path) -> Result<HashMap<String, String>> {
+    let mut names = HashMap::new();
+    if !path.exists() {
+        return Ok(names);
+    }
+
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open session index {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    while reader
+        .read_line(&mut line)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        > 0
+    {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(trimmed) {
+                if let Some(name) = normalize_display_name(&entry.thread_name) {
+                    names.insert(entry.id, name);
+                }
+            }
+        }
+        line.clear();
+    }
+
+    Ok(names)
+}
+
+fn load_state_thread_titles(path: Option<&Path>) -> Result<HashMap<String, String>> {
+    let mut titles = HashMap::new();
+    let Some(path) = path else {
+        return Ok(titles);
+    };
+    if !path.exists() {
+        return Ok(titles);
+    }
+
+    let connection =
+        Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    if !table_exists(&connection, "threads")? {
+        return Ok(titles);
+    }
+
+    let mut statement = connection.prepare("SELECT id, title FROM threads WHERE id <> ''")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (id, title) = row?;
+        if let Some(title) = title.as_deref().and_then(normalize_display_name) {
+            titles.insert(id, title);
+        }
+    }
+
+    Ok(titles)
+}
+
+fn load_history_session_names(path: &Path) -> Result<HashMap<String, String>> {
+    let mut names = HashMap::new();
+    if !path.exists() {
+        return Ok(names);
+    }
+
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open session history {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    while reader
+        .read_line(&mut line)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        > 0
+    {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if let Ok(entry) = serde_json::from_str::<HistorySessionLine>(trimmed) {
+                if !names.contains_key(&entry.session_id) {
+                    if let Some(name) = derived_session_name_from_text(&entry.text) {
+                        names.insert(entry.session_id, name);
+                    }
+                }
+            }
+        }
+        line.clear();
+    }
+
+    Ok(names)
 }
 
 fn sessions_root_in(codex_home: &Path) -> PathBuf {
@@ -1695,6 +1803,45 @@ fn is_user_prompt(text: &str) -> bool {
     true
 }
 
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let truncated: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn normalize_display_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let first_non_empty_line = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(trimmed);
+    let collapsed = first_non_empty_line
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        None
+    } else {
+        Some(collapsed)
+    }
+}
+
+fn derived_session_name_from_text(text: &str) -> Option<String> {
+    normalize_display_name(text).map(|line| truncate_chars(&line, 80))
+}
+
+fn session_summary_from_text(text: &str) -> Option<String> {
+    normalize_display_name(text).map(|line| truncate_chars(&line, 60))
+}
+
 fn normalize_path(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         fs::canonicalize(path).with_context(|| format!("failed to canonicalize {}", path.display()))
@@ -1733,6 +1880,20 @@ struct TimestampedSessionLine {
 struct SessionMeta {
     id: String,
     cwd: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionIndexEntry {
+    id: String,
+    #[serde(default)]
+    thread_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistorySessionLine {
+    session_id: String,
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1865,8 +2026,93 @@ mod tests {
         let summary = parse_session_file(&session_file, Path::new("/tmp/work"))?;
         let summary = summary.expect("expected session summary");
         assert_eq!(summary.id, "abc123");
+        assert_eq!(summary.display_name.as_deref(), Some("hello"));
         assert_eq!(summary.summary, "hello");
         assert_eq!(summary.message_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_loads_display_names_from_codex_metadata() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let codex_home = tmp.path();
+        let work_dir = Path::new("/tmp/work");
+        let sessions_dir = codex_home.join("sessions/2026/03/23");
+        fs::create_dir_all(&sessions_dir)?;
+
+        fs::write(
+            sessions_dir.join("index.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"session-index","cwd":"/tmp/work"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"rollout fallback"}]}}
+"#,
+        )?;
+        fs::write(
+            sessions_dir.join("state.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"session-state","cwd":"/tmp/work"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"rollout state fallback"}]}}
+"#,
+        )?;
+        fs::write(
+            sessions_dir.join("derived.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"session-derived","cwd":"/tmp/work"}}
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"derived from rollout"}]}}
+"#,
+        )?;
+        fs::write(
+            sessions_dir.join("history.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"session-history","cwd":"/tmp/work"}}
+"#,
+        )?;
+
+        fs::write(
+            codex_home.join("session_index.jsonl"),
+            r#"{"id":"session-index","thread_name":"indexed title","updated_at":"2026-03-23T14:26:41.943Z"}
+"#,
+        )?;
+        fs::write(
+            codex_home.join("history.jsonl"),
+            r#"{"session_id":"session-history","ts":1774283201,"text":"history fallback title"}
+"#,
+        )?;
+
+        let db_path = codex_home.join("state_7.sqlite");
+        let connection = Connection::open(&db_path)?;
+        connection.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);")?;
+        connection.execute(
+            "INSERT INTO threads (id, title) VALUES (?1, ?2)",
+            params!["session-state", "state title"],
+        )?;
+
+        let sessions = list_sessions_in(work_dir, codex_home)?;
+        let sessions_by_id = sessions
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            sessions_by_id
+                .get("session-index")
+                .and_then(|session| session.display_name.as_deref()),
+            Some("indexed title")
+        );
+        assert_eq!(
+            sessions_by_id
+                .get("session-state")
+                .and_then(|session| session.display_name.as_deref()),
+            Some("state title")
+        );
+        assert_eq!(
+            sessions_by_id
+                .get("session-derived")
+                .and_then(|session| session.display_name.as_deref()),
+            Some("derived from rollout")
+        );
+        assert_eq!(
+            sessions_by_id
+                .get("session-history")
+                .and_then(|session| session.display_name.as_deref()),
+            Some("history fallback title")
+        );
         Ok(())
     }
 
