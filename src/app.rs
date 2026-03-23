@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::codex::{
-    CodexClient, RuntimeSettings, SessionSummary, SpawnedTurn, TurnEvent, TurnOutcome, UsageReport,
+    AuthStatus, CodexClient, DeviceAuthPrompt, LoginEvent, RuntimeSettings, SessionSummary,
+    SpawnedTurn, TurnEvent, TurnOutcome, UsageReport,
 };
 use crate::config::Config;
 use crate::state::StateStore;
@@ -30,11 +31,23 @@ struct ActiveRun {
     pid: u32,
 }
 
+#[derive(Clone)]
+struct ActiveLogin {
+    login_id: u64,
+    cancel: CancellationToken,
+    started_at: Instant,
+    pid: u32,
+    verification_uri: String,
+    user_code: String,
+    expires_in_minutes: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct MessageContext {
     session_key: String,
     chat_id: i64,
     message_id: i64,
+    chat_kind: String,
     user_id: i64,
     user_name: String,
     chat_name: Option<String>,
@@ -54,7 +67,9 @@ pub struct BridgeApp {
     codex: Arc<CodexClient>,
     bot: BotIdentity,
     active_runs: Mutex<HashMap<String, ActiveRun>>,
+    active_login: Arc<Mutex<Option<ActiveLogin>>>,
     next_run_id: AtomicU64,
+    next_login_id: AtomicU64,
     startup_unix: i64,
 }
 
@@ -73,7 +88,9 @@ impl BridgeApp {
             codex,
             bot,
             active_runs: Mutex::new(HashMap::new()),
+            active_login: Arc::new(Mutex::new(None)),
             next_run_id: AtomicU64::new(1),
+            next_login_id: AtomicU64::new(1),
             startup_unix: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -146,6 +163,7 @@ impl BridgeApp {
             session_key: self.session_key(&message, from.id),
             chat_id: message.chat.id,
             message_id: message.message_id,
+            chat_kind: message.chat.kind.clone(),
             user_id: from.id,
             user_name: display_name(from),
             chat_name: message.chat.title.clone(),
@@ -169,6 +187,8 @@ impl BridgeApp {
             "switch" => self.cmd_switch(context, command.args).await?,
             "history" => self.cmd_history(context, command.args).await?,
             "usage" => self.cmd_usage(context).await?,
+            "login" => self.cmd_login(context, command.args).await?,
+            "logout" => self.cmd_logout(context).await?,
             "quiet" => self.cmd_quiet(context, command.args).await?,
             "remove" | "delete" => self.cmd_remove(context, command.args).await?,
             "current" => self.cmd_current(context).await?,
@@ -564,6 +584,197 @@ impl BridgeApp {
         Ok(())
     }
 
+    async fn cmd_login(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
+        if !self.auth_commands_allowed(context) {
+            self.reply_text(
+                context,
+                "For safety, /login and /logout only work in a private chat with the bot.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        match args.first().map(|arg| arg.to_ascii_lowercase()) {
+            None => self.cmd_login_start(context).await?,
+            Some(action) if action == "status" => self.cmd_login_status(context).await?,
+            Some(action) if action == "cancel" || action == "stop" => {
+                self.cmd_login_cancel(context).await?
+            }
+            _ => {
+                self.reply_text(context, "Usage: /login [status|cancel]")
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cmd_login_start(&self, context: &MessageContext) -> Result<()> {
+        if let Some(active) = self.active_login() {
+            self.reply_text(context, &format_active_login(&active))
+                .await?;
+            return Ok(());
+        }
+
+        let status = self.codex.login_status().await?;
+        if status.logged_in {
+            self.reply_text(
+                context,
+                &format!(
+                    "Codex is already logged in.\n{}\nUse /logout first if you want to switch to another OpenAI account.",
+                    status.summary
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let preview = self
+            .telegram
+            .send_message(
+                context.chat_id,
+                "Starting OpenAI device login...",
+                Some(context.message_id),
+            )
+            .await?;
+        let cancel = CancellationToken::new();
+        let mut spawned = match self.codex.spawn_device_login(cancel.clone()) {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                self.render_terminal_text(context, preview.message_id, &format!("Error: {err}"))
+                    .await?;
+                return Err(err);
+            }
+        };
+
+        let prompt = match spawned.events.recv().await {
+            Some(LoginEvent::Prompt(prompt)) => prompt,
+            None => match spawned.join.await {
+                Ok(Ok(outcome)) => {
+                    let message = if outcome.output.is_empty() {
+                        "Codex login exited before showing a device code.".to_string()
+                    } else {
+                        outcome.output
+                    };
+                    self.render_terminal_text(context, preview.message_id, &message)
+                        .await?;
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    self.render_terminal_text(
+                        context,
+                        preview.message_id,
+                        &format!("Error: {err}"),
+                    )
+                    .await?;
+                    return Err(err);
+                }
+                Err(err) => {
+                    let message = format!("codex login task join failed: {err}");
+                    self.render_terminal_text(context, preview.message_id, &message)
+                        .await?;
+                    return Err(anyhow!(message));
+                }
+            },
+        };
+
+        let login_id = self.register_login(cancel, spawned.pid.load(Ordering::Relaxed), &prompt);
+        edit_or_send_message(
+            &self.telegram,
+            context.chat_id,
+            preview.message_id,
+            &format_login_prompt(&prompt),
+        )
+        .await;
+
+        let telegram = self.telegram.clone();
+        let codex = Arc::clone(&self.codex);
+        let active_login = Arc::clone(&self.active_login);
+        let chat_id = context.chat_id;
+        let message_id = preview.message_id;
+        tokio::spawn(async move {
+            let text = match spawned.join.await {
+                Ok(Ok(_)) => format_login_completion(codex.login_status().await.ok()),
+                Ok(Err(err)) => {
+                    if err.to_string().contains("login cancelled") {
+                        "OpenAI login cancelled.".to_string()
+                    } else {
+                        format!(
+                            "OpenAI login failed: {}",
+                            truncate_text(&err.to_string(), 1800)
+                        )
+                    }
+                }
+                Err(err) => format!("OpenAI login task join failed: {err}"),
+            };
+            edit_or_send_message(&telegram, chat_id, message_id, &text).await;
+            finish_login(&active_login, login_id);
+        });
+
+        Ok(())
+    }
+
+    async fn cmd_login_status(&self, context: &MessageContext) -> Result<()> {
+        if let Some(active) = self.active_login() {
+            self.reply_text(context, &format_active_login(&active))
+                .await?;
+            return Ok(());
+        }
+
+        let status = self.codex.login_status().await?;
+        let text = if status.logged_in {
+            format!("Codex auth status: {}", status.summary)
+        } else {
+            "Codex auth status: Not logged in.\nUse /login to start OpenAI device login."
+                .to_string()
+        };
+        self.reply_text(context, &text).await?;
+        Ok(())
+    }
+
+    async fn cmd_login_cancel(&self, context: &MessageContext) -> Result<()> {
+        if let Some(active) = self.active_login() {
+            active.cancel.cancel();
+            self.reply_text(context, "Stopping the OpenAI login flow.")
+                .await?;
+        } else {
+            self.reply_text(context, "No OpenAI login flow is running.")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn cmd_logout(&self, context: &MessageContext) -> Result<()> {
+        if !self.auth_commands_allowed(context) {
+            self.reply_text(
+                context,
+                "For safety, /login and /logout only work in a private chat with the bot.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if self.active_login().is_some() {
+            self.reply_text(
+                context,
+                "An OpenAI login flow is already running. Use /login cancel before /logout.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let status = self.codex.logout().await?;
+        let text = if status.logged_in {
+            format!("Codex auth status: {}", status.summary)
+        } else if status.summary == "Not logged in" {
+            "Codex auth status: Not logged in.".to_string()
+        } else {
+            format!("Logged out.\n{}", status.summary)
+        };
+        self.reply_text(context, &text).await?;
+        Ok(())
+    }
+
     async fn cmd_quiet(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
         let current = self.state.session(&context.session_key);
         let next = match args.first().map(|value| value.to_ascii_lowercase()) {
@@ -629,6 +840,7 @@ impl BridgeApp {
         let session = self.state.session(&context.session_key);
         let runtime = self.state.runtime_settings();
         let running = self.active_run(&context.session_key);
+        let login = self.active_login();
         let current = session
             .thread_id
             .as_deref()
@@ -644,9 +856,23 @@ impl BridgeApp {
                 )
             })
             .unwrap_or_else(|| "no".to_string());
+        let login_text = login
+            .map(|login| {
+                format!(
+                    "pending ({}s, pid={})",
+                    login.started_at.elapsed().as_secs(),
+                    login.pid
+                )
+            })
+            .unwrap_or_else(|| "idle".to_string());
+        let codex_home = self
+            .codex
+            .codex_home()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "(default)".to_string());
 
         let text = format!(
-            "Bot: @{bot}\nUser: {user}\nUser ID: {user_id}\nChat: {chat}\nSession key: {session_key}\nWorkdir: {workdir}\nMode: {mode}\nModel: {model}\nReasoning: {reasoning}\nQuiet: {quiet}\nActive thread: {current}\nPending name: {pending_name}\nRunning: {running}",
+            "Bot: @{bot}\nUser: {user}\nUser ID: {user_id}\nChat: {chat}\nSession key: {session_key}\nWorkdir: {workdir}\nCodex home: {codex_home}\nMode: {mode}\nModel: {model}\nReasoning: {reasoning}\nQuiet: {quiet}\nActive thread: {current}\nPending name: {pending_name}\nRunning: {running}\nLogin flow: {login}",
             bot = self.bot.username,
             user = context.user_name,
             user_id = context.user_id,
@@ -656,6 +882,7 @@ impl BridgeApp {
                 .unwrap_or_else(|| context.chat_id.to_string()),
             session_key = context.session_key,
             workdir = self.codex.work_dir().display(),
+            codex_home = codex_home,
             mode = runtime.mode,
             model = runtime.model.unwrap_or_else(|| "(default)".to_string()),
             reasoning = runtime
@@ -663,6 +890,7 @@ impl BridgeApp {
                 .unwrap_or_else(|| "(default)".to_string()),
             quiet = if session.quiet { "on" } else { "off" },
             running = running_text,
+            login = login_text,
         );
         self.reply_text(context, &text).await?;
         Ok(())
@@ -804,6 +1032,33 @@ impl BridgeApp {
         self.active_runs.lock().get(session_key).cloned()
     }
 
+    fn register_login(
+        &self,
+        cancel: CancellationToken,
+        pid: u32,
+        prompt: &DeviceAuthPrompt,
+    ) -> u64 {
+        let login_id = self.next_login_id.fetch_add(1, Ordering::Relaxed);
+        *self.active_login.lock() = Some(ActiveLogin {
+            login_id,
+            cancel,
+            started_at: Instant::now(),
+            pid,
+            verification_uri: prompt.verification_uri.clone(),
+            user_code: prompt.user_code.clone(),
+            expires_in_minutes: prompt.expires_in_minutes,
+        });
+        login_id
+    }
+
+    fn active_login(&self) -> Option<ActiveLogin> {
+        self.active_login.lock().clone()
+    }
+
+    fn auth_commands_allowed(&self, context: &MessageContext) -> bool {
+        context.chat_kind == "private"
+    }
+
     fn session_key(&self, message: &Message, user_id: i64) -> String {
         if self.config.telegram.share_session_in_channel {
             format!("telegram:{}", message.chat.id)
@@ -893,6 +1148,8 @@ fn help_text() -> String {
         "/switch <number|id|name> - Switch to a previous session",
         "/history [n] - Show recent messages for the current session",
         "/usage - Show Codex quota usage",
+        "/login [status|cancel] - Start or inspect OpenAI login",
+        "/logout - Remove the current Codex login",
         "/quiet [on|off] - Toggle progress messages for this chat",
         "/remove <number|id|name> - Delete a session from local Codex storage",
         "/current - Show the current session",
@@ -932,6 +1189,14 @@ fn menu_commands() -> Vec<BotCommand> {
         BotCommand {
             command: "usage".to_string(),
             description: "Show Codex quota usage".to_string(),
+        },
+        BotCommand {
+            command: "login".to_string(),
+            description: "OpenAI account login".to_string(),
+        },
+        BotCommand {
+            command: "logout".to_string(),
+            description: "Log out of Codex".to_string(),
         },
         BotCommand {
             command: "quiet".to_string(),
@@ -1059,12 +1324,75 @@ fn split_text(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+fn finish_login(active_login: &Arc<Mutex<Option<ActiveLogin>>>, login_id: u64) {
+    let mut slot = active_login.lock();
+    let should_remove = slot
+        .as_ref()
+        .is_some_and(|active| active.login_id == login_id);
+    if should_remove {
+        *slot = None;
+    }
+}
+
+fn format_active_login(active: &ActiveLogin) -> String {
+    let expiry = active
+        .expires_in_minutes
+        .map(|minutes| format!("\nExpires in about {minutes} minutes."))
+        .unwrap_or_default();
+    format!(
+        "An OpenAI login flow is already running.\nURL: {url}\nCode: {code}{expiry}\nStarted: {started}s ago\nUse /login cancel to stop it.",
+        url = active.verification_uri,
+        code = active.user_code,
+        expiry = expiry,
+        started = active.started_at.elapsed().as_secs(),
+    )
+}
+
+fn format_login_prompt(prompt: &DeviceAuthPrompt) -> String {
+    let expiry = prompt
+        .expires_in_minutes
+        .map(|minutes| format!("\nThis code expires in about {minutes} minutes."))
+        .unwrap_or_default();
+    format!(
+        "OpenAI login started for this bot.\n\n1. Open: {url}\n2. Sign in with the OpenAI account you want Codex to use.\n3. Enter code: {code}{expiry}\n\nWhen the browser flow finishes, this message will update.\nUse /login cancel to abort.",
+        url = prompt.verification_uri,
+        code = prompt.user_code,
+        expiry = expiry,
+    )
+}
+
+fn format_login_completion(status: Option<AuthStatus>) -> String {
+    match status {
+        Some(status) if status.logged_in => format!(
+            "OpenAI login complete.\n{}\nNew turns will use this account.",
+            status.summary
+        ),
+        Some(status) => format!("OpenAI login finished.\n{}", status.summary),
+        None => "OpenAI login complete. New turns will use the updated account.".to_string(),
+    }
+}
+
 fn truncate_text(text: &str, max_chars: usize) -> String {
     let mut out = text.chars().take(max_chars).collect::<String>();
     if text.chars().count() > max_chars {
         out.push_str("...");
     }
     out
+}
+
+async fn edit_or_send_message(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) {
+    if telegram
+        .edit_message(chat_id, message_id, text)
+        .await
+        .is_err()
+    {
+        let _ = telegram.send_message(chat_id, text, None).await;
+    }
 }
 
 fn join_args(args: Vec<String>) -> Option<String> {

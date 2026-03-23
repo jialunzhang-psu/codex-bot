@@ -14,7 +14,7 @@ use reqwest::Client;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -184,6 +184,35 @@ pub struct SpawnedTurn {
     pub pid: Arc<AtomicU32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthStatus {
+    pub logged_in: bool,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceAuthPrompt {
+    pub verification_uri: String,
+    pub user_code: String,
+    pub expires_in_minutes: Option<u64>,
+}
+
+#[derive(Debug)]
+pub enum LoginEvent {
+    Prompt(DeviceAuthPrompt),
+}
+
+#[derive(Debug)]
+pub struct LoginOutcome {
+    pub output: String,
+}
+
+pub struct SpawnedLogin {
+    pub events: mpsc::Receiver<LoginEvent>,
+    pub join: JoinHandle<Result<LoginOutcome>>,
+    pub pid: Arc<AtomicU32>,
+}
+
 #[derive(Clone)]
 pub struct CodexClient {
     bin: String,
@@ -197,6 +226,15 @@ struct EventParser {
     pending_messages: Vec<String>,
     final_text: Option<String>,
     fatal_error: Option<String>,
+}
+
+#[derive(Default)]
+struct DeviceAuthParser {
+    verification_uri: Option<String>,
+    user_code: Option<String>,
+    expires_in_minutes: Option<u64>,
+    output_lines: Vec<String>,
+    prompt_emitted: bool,
 }
 
 fn default_mode() -> String {
@@ -243,10 +281,6 @@ impl RuntimeSettings {
 }
 
 impl CodexStore {
-    fn new() -> Result<Self> {
-        Self::from_home(codex_home()?)
-    }
-
     fn from_home(codex_home: PathBuf) -> Result<Self> {
         let state_db_path = find_latest_state_db(&codex_home)?;
         Ok(Self {
@@ -272,6 +306,21 @@ impl CodexClient {
         &self.work_dir
     }
 
+    pub fn codex_home(&self) -> Result<PathBuf> {
+        if let Some(value) = self
+            .extra_env
+            .iter()
+            .rev()
+            .filter_map(parse_env_pair)
+            .find_map(|(name, value)| (name == "CODEX_HOME").then_some(value))
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(PathBuf::from(value));
+        }
+
+        codex_home()
+    }
+
     pub fn spawn_turn(
         &self,
         thread_id: Option<&str>,
@@ -284,16 +333,12 @@ impl CodexClient {
         }
 
         let args = build_exec_args(&self.work_dir, thread_id, settings, prompt);
-        let mut command = Command::new(&self.bin);
+        let mut command = self.command();
         command
             .args(&args)
             .current_dir(&self.work_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-
-        if !self.extra_env.is_empty() {
-            command.envs(self.extra_env.iter().filter_map(parse_env_pair));
-        }
 
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -318,6 +363,7 @@ impl CodexClient {
         let join = {
             let child = Arc::clone(&child);
             let pid_ref = Arc::clone(&pid);
+            let codex_home = self.codex_home().ok();
             tokio::spawn(async move {
                 let stderr_task = tokio::spawn(async move {
                     let mut buf = String::new();
@@ -378,8 +424,10 @@ impl CodexClient {
 
                 drop(tx);
 
-                if let Some(thread_id) = &parser.thread_id {
-                    let _ = patch_session_source(thread_id);
+                if let (Some(thread_id), Some(codex_home)) =
+                    (&parser.thread_id, codex_home.as_deref())
+                {
+                    let _ = patch_session_source_in(codex_home, thread_id);
                 }
 
                 if cancel.is_cancelled() {
@@ -414,20 +462,183 @@ impl CodexClient {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
-        list_sessions(&self.work_dir)
+        list_sessions_in(&self.work_dir, &self.codex_home()?)
     }
 
     pub fn get_session_history(&self, session_id: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
-        get_session_history(session_id, limit)
+        get_session_history_in(session_id, limit, &self.codex_home()?)
     }
 
     pub async fn get_usage(&self) -> Result<UsageReport> {
-        let tokens = read_oauth_tokens()?;
+        let tokens = read_oauth_tokens_in(&self.codex_home()?)?;
         fetch_usage(&Client::new(), tokens).await
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
-        delete_session_artifacts(session_id)
+        delete_session_artifacts_in(&self.codex_home()?, session_id)
+    }
+
+    pub async fn login_status(&self) -> Result<AuthStatus> {
+        let output = self.run_command_capture(&["login", "status"]).await?;
+        let summary = summarize_auth_status(&output.output);
+
+        if output.status.success() {
+            return Ok(AuthStatus {
+                logged_in: true,
+                summary,
+            });
+        }
+
+        if summary == "Not logged in" {
+            return Ok(AuthStatus {
+                logged_in: false,
+                summary,
+            });
+        }
+
+        Err(anyhow!(
+            "failed to read login status: {}",
+            if output.output.is_empty() {
+                format!("codex login status exited with {}", output.status)
+            } else {
+                output.output
+            }
+        ))
+    }
+
+    pub async fn logout(&self) -> Result<AuthStatus> {
+        let output = self.run_command_capture(&["logout"]).await?;
+        if !output.status.success() && summarize_auth_status(&output.output) != "Not logged in" {
+            return Err(anyhow!(
+                "failed to log out: {}",
+                if output.output.is_empty() {
+                    format!("codex logout exited with {}", output.status)
+                } else {
+                    output.output
+                }
+            ));
+        }
+
+        self.login_status().await
+    }
+
+    pub fn spawn_device_login(&self, cancel: CancellationToken) -> Result<SpawnedLogin> {
+        let args = ["login", "--device-auth"];
+        let mut command = self.command();
+        command
+            .args(args)
+            .current_dir(&self.work_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start codex login process: {} {}",
+                self.bin,
+                args.join(" ")
+            )
+        })?;
+
+        let pid = Arc::new(AtomicU32::new(child.id().unwrap_or_default()));
+        let stdout = child
+            .stdout
+            .take()
+            .context("codex login stdout pipe is unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("codex login stderr pipe is unavailable")?;
+        let child = Arc::new(Mutex::new(child));
+
+        let (tx, rx) = mpsc::channel(8);
+        let join = {
+            let child = Arc::clone(&child);
+            let pid_ref = Arc::clone(&pid);
+            tokio::spawn(async move {
+                let (line_tx, mut line_rx) = mpsc::channel(64);
+                let stdout_task = tokio::spawn(stream_lines(stdout, line_tx.clone()));
+                let stderr_task = tokio::spawn(stream_lines(stderr, line_tx));
+
+                let killer_task = {
+                    let child = Arc::clone(&child);
+                    let cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        cancel.cancelled().await;
+                        let mut child = child.lock().await;
+                        let _ = child.start_kill();
+                    })
+                };
+
+                let mut parser = DeviceAuthParser::default();
+                while let Some(line) = line_rx.recv().await {
+                    if let Some(prompt) = parser.ingest_line(&line) {
+                        if tx.send(LoginEvent::Prompt(prompt)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+
+                let status = {
+                    let mut child = child.lock().await;
+                    let status = child
+                        .wait()
+                        .await
+                        .context("failed to wait for codex login")?;
+                    pid_ref.store(0, Ordering::Relaxed);
+                    status
+                };
+
+                killer_task.abort();
+                stdout_task.await.context("stdout task join failed")??;
+                stderr_task.await.context("stderr task join failed")??;
+                drop(tx);
+
+                if cancel.is_cancelled() {
+                    return Err(anyhow!("login cancelled"));
+                }
+
+                if !status.success() {
+                    let output = parser.output_text();
+                    if !output.is_empty() {
+                        return Err(anyhow!(output));
+                    }
+                    return Err(anyhow!("codex login exited with status {status}"));
+                }
+
+                Ok(LoginOutcome {
+                    output: parser.output_text(),
+                })
+            })
+        };
+
+        Ok(SpawnedLogin {
+            events: rx,
+            join,
+            pid,
+        })
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.bin);
+        if !self.extra_env.is_empty() {
+            command.envs(self.extra_env.iter().filter_map(parse_env_pair));
+        }
+        command
+    }
+
+    async fn run_command_capture(&self, args: &[&str]) -> Result<CapturedOutput> {
+        let output = self
+            .command()
+            .args(args)
+            .current_dir(&self.work_dir)
+            .output()
+            .await
+            .with_context(|| format!("failed to run {} {}", self.bin, args.join(" ")))?;
+
+        Ok(CapturedOutput {
+            status: output.status,
+            output: merge_command_output(&output.stdout, &output.stderr),
+        })
     }
 }
 
@@ -532,6 +743,54 @@ impl EventParser {
         self.pending_messages.clear();
         Some(text)
     }
+}
+
+impl DeviceAuthParser {
+    fn ingest_line(&mut self, raw_line: &str) -> Option<DeviceAuthPrompt> {
+        let line = strip_ansi_codes(raw_line).replace('\r', "");
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+
+        self.output_lines.push(line.to_string());
+
+        if self.verification_uri.is_none() {
+            self.verification_uri = extract_url(line);
+        }
+        if self.user_code.is_none() {
+            self.user_code = extract_device_code(line);
+        }
+        if self.expires_in_minutes.is_none() {
+            self.expires_in_minutes = extract_expiry_minutes(line);
+        }
+
+        if self.prompt_emitted {
+            return None;
+        }
+
+        let (Some(verification_uri), Some(user_code)) =
+            (self.verification_uri.clone(), self.user_code.clone())
+        else {
+            return None;
+        };
+
+        self.prompt_emitted = true;
+        Some(DeviceAuthPrompt {
+            verification_uri,
+            user_code,
+            expires_in_minutes: self.expires_in_minutes,
+        })
+    }
+
+    fn output_text(&self) -> String {
+        self.output_lines.join("\n")
+    }
+}
+
+struct CapturedOutput {
+    status: std::process::ExitStatus,
+    output: String,
 }
 
 fn build_exec_args(
@@ -728,9 +987,9 @@ fn extract_tool_input(item: &Map<String, Value>) -> String {
         .to_string()
 }
 
-pub fn list_sessions(work_dir: &Path) -> Result<Vec<SessionSummary>> {
+fn list_sessions_in(work_dir: &Path, codex_home: &Path) -> Result<Vec<SessionSummary>> {
     let work_dir = normalize_path(work_dir)?;
-    let sessions_dir = sessions_root()?;
+    let sessions_dir = sessions_root_in(codex_home);
     if !sessions_dir.exists() {
         return Ok(Vec::new());
     }
@@ -747,8 +1006,12 @@ pub fn list_sessions(work_dir: &Path) -> Result<Vec<SessionSummary>> {
     Ok(sessions)
 }
 
-pub fn get_session_history(session_id: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
-    let Some(path) = find_session_file(session_id)? else {
+fn get_session_history_in(
+    session_id: &str,
+    limit: usize,
+    codex_home: &Path,
+) -> Result<Vec<HistoryEntry>> {
+    let Some(path) = find_session_file_in(codex_home, session_id)? else {
         bail!("session file not found: {session_id}");
     };
 
@@ -835,10 +1098,6 @@ pub fn get_session_history(session_id: &str, limit: usize) -> Result<Vec<History
     Ok(entries)
 }
 
-pub fn delete_session_artifacts(session_id: &str) -> Result<()> {
-    delete_session_artifacts_in(&codex_home()?, session_id)
-}
-
 fn parse_session_file(path: &Path, filter_cwd: &Path) -> Result<Option<SessionSummary>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to open session transcript {}", path.display()))?;
@@ -920,12 +1179,12 @@ fn parse_session_file(path: &Path, filter_cwd: &Path) -> Result<Option<SessionSu
     }))
 }
 
-fn sessions_root() -> Result<PathBuf> {
-    Ok(codex_home()?.join("sessions"))
+fn sessions_root_in(codex_home: &Path) -> PathBuf {
+    codex_home.join("sessions")
 }
 
-fn find_session_file(session_id: &str) -> Result<Option<PathBuf>> {
-    let store = CodexStore::new()?;
+fn find_session_file_in(codex_home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    let store = CodexStore::from_home(codex_home.to_path_buf())?;
     let paths = find_session_files_in(&store, session_id)?;
     let best = paths
         .into_iter()
@@ -1160,8 +1419,8 @@ fn find_latest_state_db(codex_home: &Path) -> Result<Option<PathBuf>> {
     Ok(best.map(|(_, path)| path))
 }
 
-fn read_oauth_tokens() -> Result<OAuthTokens> {
-    let store = CodexStore::new()?;
+fn read_oauth_tokens_in(codex_home: &Path) -> Result<OAuthTokens> {
+    let store = CodexStore::from_home(codex_home.to_path_buf())?;
     let raw = fs::read(&store.auth_path)
         .with_context(|| format!("failed to read {}", store.auth_path.display()))?;
     let payload: OAuthPayload =
@@ -1280,8 +1539,8 @@ fn map_usage_windows(bucket: RawUsageBucket) -> Vec<UsageWindow> {
     windows
 }
 
-pub fn patch_session_source(session_id: &str) -> Result<()> {
-    let Some(path) = find_session_file(session_id)? else {
+fn patch_session_source_in(codex_home: &Path, session_id: &str) -> Result<()> {
+    let Some(path) = find_session_file_in(codex_home, session_id)? else {
         return Ok(());
     };
 
@@ -1315,6 +1574,111 @@ pub fn patch_session_source(session_id: &str) -> Result<()> {
     output.extend_from_slice(&original[first_newline..]);
     fs::write(&path, output).with_context(|| format!("failed to patch {}", path.display()))?;
     Ok(())
+}
+
+async fn stream_lines<R>(reader: R, tx: mpsc::Sender<String>) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("failed to read codex login output")?
+    {
+        if tx.send(line).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn merge_command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut lines = Vec::new();
+    for buf in [stdout, stderr] {
+        let text = String::from_utf8_lossy(buf);
+        for line in strip_ansi_codes(&text).lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_string());
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn summarize_auth_status(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("WARNING:"))
+        .map(str::to_string)
+        .unwrap_or_else(|| "Not logged in".to_string())
+}
+
+fn strip_ansi_codes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                let _ = chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
+fn extract_url(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .map(|part| part.trim_matches(|ch: char| ",.;:()[]{}".contains(ch)))
+        .find(|part| part.starts_with("https://") || part.starts_with("http://"))
+        .map(str::to_string)
+}
+
+fn extract_device_code(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .map(|part| part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-'))
+        .find(|part| looks_like_device_code(part))
+        .map(str::to_string)
+}
+
+fn looks_like_device_code(value: &str) -> bool {
+    let mut groups = 0usize;
+    for part in value.split('-') {
+        if part.len() < 3
+            || !part
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+        {
+            return false;
+        }
+        groups += 1;
+    }
+    groups >= 2
+}
+
+fn extract_expiry_minutes(line: &str) -> Option<u64> {
+    let lower = line.to_ascii_lowercase();
+    let marker = "expires in ";
+    let start = lower.find(marker)? + marker.len();
+    let suffix = &lower[start..];
+    let number = suffix.split_whitespace().next()?.parse::<u64>().ok()?;
+    if suffix.contains("minute") {
+        Some(number)
+    } else {
+        None
+    }
 }
 
 fn is_user_prompt(text: &str) -> bool {
@@ -1444,6 +1808,46 @@ mod tests {
         assert!(
             matches!(events.as_slice(), [TurnEvent::Status(text)] if text.contains("rust telegram") && text.contains("codex cli"))
         );
+    }
+
+    #[test]
+    fn device_auth_parser_extracts_prompt_from_ansi_output() {
+        let mut parser = DeviceAuthParser::default();
+        assert!(
+            parser
+                .ingest_line("\u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m")
+                .is_none()
+        );
+
+        let prompt = parser
+            .ingest_line("  \u{1b}[94mD0XJ-05VIZ\u{1b}[0m")
+            .expect("expected device auth prompt");
+        assert_eq!(
+            prompt.verification_uri,
+            "https://auth.openai.com/codex/device"
+        );
+        assert_eq!(prompt.user_code, "D0XJ-05VIZ");
+        assert_eq!(prompt.expires_in_minutes, None);
+    }
+
+    #[test]
+    fn device_auth_parser_extracts_expiry_minutes() {
+        let mut parser = DeviceAuthParser::default();
+        assert!(
+            parser
+                .ingest_line("2. Enter this one-time code (expires in 15 minutes)")
+                .is_none()
+        );
+        assert!(
+            parser
+                .ingest_line("https://auth.openai.com/codex/device")
+                .is_none()
+        );
+
+        let prompt = parser
+            .ingest_line("ABCD-12345")
+            .expect("expected device auth prompt");
+        assert_eq!(prompt.expires_in_minutes, Some(15));
     }
 
     #[test]
