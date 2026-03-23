@@ -1,0 +1,17 @@
+log_level = "info"
+state_path = "./codex-telegram-bridge-state.json"
+
+[telegram]
+token = "123456:replace-me"
+allow_from = [123456789]
+group_reply_all = false
+share_session_in_channel = false
+poll_timeout_seconds = 30
+
+[codex]
+work_dir = "/absolute/path/to/your/project"
+bin = "codex"
+model = "gpt-5.4"
+reasoning_effort = "high"
+mode = "suggest"
+extra_env = []
