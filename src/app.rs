@@ -14,8 +14,8 @@ use tracing::{info, warn};
 
 use crate::codex::{
     AddAccountResult, CodexClient, DeviceAuthPrompt, LoginEvent, PoolAccountView, PoolList,
-    PoolUsageReport, RuntimeSettings, SessionSummary, SpawnedTurn, StoredAccount, TurnEvent,
-    TurnOutcome, UsageReport,
+    PoolUsageReport, ReviewRequest, RuntimeSettings, SessionSummary, SpawnedReview, SpawnedTurn,
+    StoredAccount, TurnEvent, TurnOutcome, UsageReport,
 };
 use crate::config::Config;
 use crate::state::StateStore;
@@ -24,9 +24,32 @@ use crate::telegram::{BotCommand, BotIdentity, Message, SentMessage, TelegramCli
 const PAGE_SIZE: usize = 12;
 const TELEGRAM_MESSAGE_LIMIT: usize = 3800;
 
+#[derive(Clone, Copy)]
+enum RunKind {
+    Prompt,
+    Review,
+}
+
+impl RunKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Review => "review",
+        }
+    }
+
+    fn stop_text(self) -> &'static str {
+        match self {
+            Self::Prompt => "Stopping the current request.",
+            Self::Review => "Stopping the current review.",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ActiveRun {
     run_id: u64,
+    kind: RunKind,
     cancel: CancellationToken,
     started_at: Instant,
     pid: u32,
@@ -188,6 +211,7 @@ impl BridgeApp {
             "list" => self.cmd_list(context, command.args).await?,
             "switch" => self.cmd_switch(context, command.args).await?,
             "history" => self.cmd_history(context, command.args).await?,
+            "review" => self.cmd_review(context, command.args).await?,
             "usage" => self.cmd_usage(context).await?,
             "login" | "add-account" | "add_account" => {
                 self.cmd_login(context, command.args).await?
@@ -251,6 +275,7 @@ impl BridgeApp {
 
         let run_id = self.register_run(
             &context.session_key,
+            RunKind::Prompt,
             cancel.clone(),
             spawned.pid.load(Ordering::Relaxed),
         );
@@ -276,6 +301,72 @@ impl BridgeApp {
         }
 
         Ok(())
+    }
+
+    async fn cmd_review(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
+        if !self.auth_commands_allowed(context) {
+            self.reply_text(
+                context,
+                "For safety, /review only works in a private chat with the bot.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if self.active_run(&context.session_key).is_some() {
+            self.reply_text(
+                context,
+                "A Codex request is already running for this chat. Wait for it to finish or use /stop.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if args.len() == 1 && args[0].eq_ignore_ascii_case("help") {
+            self.reply_text(context, &review_help_text()).await?;
+            return Ok(());
+        }
+
+        let request = match ReviewRequest::from_args(&args) {
+            Ok(request) => request,
+            Err(err) => {
+                self.reply_text(context, &err.to_string()).await?;
+                return Ok(());
+            }
+        };
+
+        let settings = self.state.runtime_settings();
+        let cancel = CancellationToken::new();
+        let preview = self
+            .telegram
+            .send_message(context.chat_id, "Reviewing...", Some(context.message_id))
+            .await?;
+        let spawned = match self.codex.spawn_review(&settings, &request, cancel.clone()) {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                self.render_terminal_text(context, preview.message_id, &format!("Error: {err}"))
+                    .await?;
+                return Err(err);
+            }
+        };
+
+        let run_id = self.register_run(
+            &context.session_key,
+            RunKind::Review,
+            cancel.clone(),
+            spawned.pid.load(Ordering::Relaxed),
+        );
+        let typing_task = self.spawn_typing_task(context.chat_id, cancel.clone());
+        let result = self.collect_review_output(context, preview, spawned).await;
+        cancel.cancel();
+        typing_task.abort();
+        self.finish_run(&context.session_key, run_id);
+
+        if let Err(err) = &result {
+            warn!(session = %context.session_key, error = %err, "review failed");
+        }
+
+        result
     }
 
     async fn collect_turn_output(
@@ -361,6 +452,55 @@ impl BridgeApp {
         }
 
         Ok(outcome)
+    }
+
+    async fn collect_review_output(
+        &self,
+        context: &MessageContext,
+        preview: SentMessage,
+        spawned: SpawnedReview,
+    ) -> Result<()> {
+        match spawned.join.await {
+            Ok(Ok(outcome)) => {
+                let text = if outcome.final_text.trim().is_empty() {
+                    "Review completed with no output."
+                } else {
+                    outcome.final_text.as_str()
+                };
+                self.render_terminal_text(context, preview.message_id, text)
+                    .await?;
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                let message = err.to_string();
+                if message.contains("review cancelled") {
+                    self.render_terminal_text(
+                        context,
+                        preview.message_id,
+                        "Review stopped. Re-run /review and wait for it to complete.",
+                    )
+                    .await?;
+                } else {
+                    self.render_terminal_text(
+                        context,
+                        preview.message_id,
+                        &format!("Error: {message}"),
+                    )
+                    .await?;
+                }
+                Err(err)
+            }
+            Err(err) => {
+                let message = format!("codex review task join failed: {err}");
+                self.render_terminal_text(
+                    context,
+                    preview.message_id,
+                    &format!("Error: {message}"),
+                )
+                .await?;
+                Err(anyhow!(message))
+            }
+        }
     }
 
     async fn render_terminal_text(
@@ -1037,7 +1177,8 @@ impl BridgeApp {
         let running_text = running
             .map(|run| {
                 format!(
-                    "yes ({}s, pid={})",
+                    "yes ({}, {}s, pid={})",
+                    run.kind.label(),
                     run.started_at.elapsed().as_secs(),
                     run.pid
                 )
@@ -1175,8 +1316,7 @@ impl BridgeApp {
     async fn cmd_stop(&self, context: &MessageContext) -> Result<()> {
         if let Some(run) = self.active_run(&context.session_key) {
             run.cancel.cancel();
-            self.reply_text(context, "Stopping the current request.")
-                .await?;
+            self.reply_text(context, run.kind.stop_text()).await?;
         } else {
             self.reply_text(context, "No active request is running.")
                 .await?;
@@ -1193,12 +1333,19 @@ impl BridgeApp {
         Ok(())
     }
 
-    fn register_run(&self, session_key: &str, cancel: CancellationToken, pid: u32) -> u64 {
+    fn register_run(
+        &self,
+        session_key: &str,
+        kind: RunKind,
+        cancel: CancellationToken,
+        pid: u32,
+    ) -> u64 {
         let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         self.active_runs.lock().insert(
             session_key.to_string(),
             ActiveRun {
                 run_id,
+                kind,
                 cancel,
                 started_at: Instant::now(),
                 pid,
@@ -1342,6 +1489,9 @@ fn help_text() -> String {
         "/list [page] - List Codex sessions in this workdir",
         "/switch <number|id|name> - Switch to a previous session",
         "/history [n] - Show recent messages for the current session",
+        "/review [notes] - Review uncommitted changes",
+        "/review base <branch> [notes] - Review changes against a base branch",
+        "/review commit <sha> [notes] - Review a commit",
         "/usage - Show pooled account quota usage",
         "/add-account [label|status|cancel] - Add/login a pooled OpenAI account",
         "/list-accounts - List pooled Codex accounts",
@@ -1358,6 +1508,22 @@ fn help_text() -> String {
         "/stop - Stop the current request",
         "",
         "Any non-command text is forwarded to Codex.",
+    ]
+    .join("\n")
+}
+
+fn review_help_text() -> String {
+    [
+        "Usage:",
+        "/review [notes]",
+        "/review base <branch> [notes]",
+        "/review commit <sha> [notes]",
+        "",
+        "Examples:",
+        "/review",
+        "/review focus on bugs, regressions, and missing tests",
+        "/review base main focus on behavioral regressions",
+        "/review commit abc123 check for migration risks",
     ]
     .join("\n")
 }
@@ -1383,6 +1549,10 @@ fn menu_commands() -> Vec<BotCommand> {
         BotCommand {
             command: "history".to_string(),
             description: "Show recent session history".to_string(),
+        },
+        BotCommand {
+            command: "review".to_string(),
+            description: "Review code changes".to_string(),
         },
         BotCommand {
             command: "usage".to_string(),
