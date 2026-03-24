@@ -26,8 +26,12 @@ use crate::telegram::TelegramClient;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long, env = "BRIDGE_CONFIG", default_value = "config.toml")]
-    config: PathBuf,
+    #[arg(
+        long,
+        env = "BRIDGE_CONFIG",
+        help = "Config file path. Defaults to ./config.toml, then ~/.codex-bot/config.toml"
+    )]
+    config: Option<PathBuf>,
     #[arg(long, env = "BRIDGE_PROJECT")]
     project: Option<String>,
     #[command(subcommand)]
@@ -55,11 +59,12 @@ async fn main() -> Result<()> {
 
 async fn run(log_handle: reload::Handle<EnvFilter, Registry>) -> Result<()> {
     let args = Args::parse();
+    let config_path = resolve_config_path(args.config);
     match args.command {
         Some(CliCommand::Accounts { command }) => {
-            account_cli::run(&args.config, args.project.as_deref(), command).await
+            account_cli::run(&config_path, args.project.as_deref(), command).await
         }
-        None => run_bridge(log_handle, args.config, args.project).await,
+        None => run_bridge(log_handle, config_path, args.project).await,
     }
 }
 
@@ -126,6 +131,40 @@ fn reload_log_level(handle: &reload::Handle<EnvFilter, Registry>, default_level:
 
 fn build_env_filter(default_level: &str) -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level.to_string()))
+}
+
+fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
+    resolve_config_path_with(
+        explicit,
+        PathBuf::from("config.toml"),
+        default_config_path(),
+    )
+}
+
+fn default_config_path() -> Option<PathBuf> {
+    default_config_path_from_home(
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    )
+}
+
+fn resolve_config_path_with(
+    explicit: Option<PathBuf>,
+    local: PathBuf,
+    default: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path;
+    }
+    if local.exists() {
+        return local;
+    }
+    default.unwrap_or(local)
+}
+
+fn default_config_path_from_home(home: Option<PathBuf>) -> Option<PathBuf> {
+    home.map(|home| home.join(".codex-bot").join("config.toml"))
 }
 
 async fn run_supervisor(config_path: PathBuf, projects: Vec<String>) -> Result<()> {
@@ -200,5 +239,50 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use super::{default_config_path_from_home, resolve_config_path_with};
+
+    #[test]
+    fn resolve_config_path_prefers_explicit_path() {
+        let explicit = PathBuf::from("/tmp/custom-config.toml");
+        let local = PathBuf::from("/tmp/config.toml");
+        let default = Some(PathBuf::from("/tmp/.codex-bot/config.toml"));
+        assert_eq!(
+            resolve_config_path_with(Some(explicit.clone()), local, default),
+            explicit
+        );
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_local_config_when_present() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let local = temp_dir.path().join("config.toml");
+        let default = temp_dir.path().join(".codex-bot").join("config.toml");
+        fs::write(&local, "").expect("write local config");
+        assert_eq!(
+            resolve_config_path_with(None, local.clone(), Some(default)),
+            local
+        );
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_default_home_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let local = temp_dir.path().join("config.toml");
+        let default =
+            default_config_path_from_home(Some(temp_dir.path().to_path_buf())).expect("default");
+        assert_eq!(
+            resolve_config_path_with(None, local, Some(default.clone())),
+            default
+        );
     }
 }
