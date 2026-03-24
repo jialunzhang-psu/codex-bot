@@ -1,6 +1,6 @@
-# Codex Telegram Bridge
+# codex-bot
 
-`codex-telegram-bridge` is a small Rust bridge that runs the local `codex` CLI behind a Telegram bot.
+`codex-bot` is a small Rust bot that runs the local `codex` CLI behind Telegram.
 It is a focused replacement for the Codex -> Telegram part of `cc-connect`.
 
 It covers:
@@ -29,7 +29,7 @@ Copy `config.example.toml` to `config.toml` and edit it:
 
 ```toml
 log_level = "info"
-state_path = "./codex-telegram-bridge-state.json"
+state_path = "./codex-bot-state.json"
 
 [telegram]
 token = "123456:replace-me"
@@ -105,7 +105,7 @@ Non-command text is forwarded to Codex as the next prompt.
 - `/quiet [on|off]`: hide or show thinking/tool progress messages for the current chat
 - `/remove <number|id|name>`: delete a saved session after selecting it from `/list`
 - `/current`: show the current session
-- `/status`: show bridge/runtime status
+- `/status`: show bot/runtime status
 - `/mode [suggest|full-auto|yolo]`: show or set Codex mode
 - `/model [name]`: show or set the Codex model
 - `/reasoning [low|medium|high|xhigh]`: show or set reasoning effort
@@ -113,7 +113,7 @@ Non-command text is forwarded to Codex as the next prompt.
 
 ## Notes
 
-- Session state is stored in `codex-telegram-bridge-state.json` by default.
+- Session state is stored in `codex-bot-state.json` by default.
 - `/new` and `/switch` are generation-guarded so an older cancelled run cannot overwrite a newer session selection.
 - `/remove` performs a full local cleanup: transcript files, `session_index.jsonl`, `history.jsonl`, and matching thread rows in the latest `state_*.sqlite`.
 - `/usage` reads `auth.json` from the same Codex home the bridge uses and calls the Codex usage endpoint directly.

@@ -1,5 +1,5 @@
 [package]
-name = "codex-telegram-bridge"
+name = "codex-bot"
 version = "0.1.0"
 edition = "2024"
 

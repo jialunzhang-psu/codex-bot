@@ -1,5 +1,5 @@
 log_level = "info"
-state_path = "./codex-telegram-bridge-state.json"
+state_path = "./codex-bot-state.json"
 
 [telegram]
 token = "123456:replace-me"

@@ -105,7 +105,7 @@ impl BridgeApp {
         info!(
             bot = %self.bot.username,
             work_dir = %self.codex.work_dir().display(),
-            "telegram bridge started"
+            "codex-bot started"
         );
 
         let mut offset = 0i64;
@@ -1418,7 +1418,7 @@ fn menu_commands() -> Vec<BotCommand> {
         },
         BotCommand {
             command: "status".to_string(),
-            description: "Show bridge status".to_string(),
+            description: "Show bot status".to_string(),
         },
         BotCommand {
             command: "mode".to_string(),

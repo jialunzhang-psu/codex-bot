@@ -47,7 +47,7 @@ enum CliCommand {
 async fn main() -> Result<()> {
     let log_handle = init_tracing("info");
     if let Err(err) = run(log_handle).await {
-        error!(error = %err, "bridge exited with error");
+        error!(error = %err, "codex-bot exited with error");
         return Err(err);
     }
     Ok(())
@@ -68,7 +68,7 @@ async fn run_bridge(
     config_path: PathBuf,
     project: Option<String>,
 ) -> Result<()> {
-    info!(config = %config_path.display(), "starting codex telegram bridge");
+    info!(config = %config_path.display(), "starting codex-bot");
     let discovered_projects = Config::discover_projects(&config_path)?;
     if project.is_none() && discovered_projects.len() > 1 {
         info!(

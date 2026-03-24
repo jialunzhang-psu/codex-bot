@@ -6,6 +6,11 @@ use serde::Deserialize;
 
 use crate::codex::RuntimeSettings;
 
+const DEFAULT_STATE_FILE_NAME: &str = "codex-bot-state.json";
+const LEGACY_DEFAULT_STATE_FILE_NAME: &str = "codex-telegram-bridge-state.json";
+const DEFAULT_LEGACY_PROJECT_STATE_PREFIX: &str = "codex-bot";
+const LEGACY_PROJECT_STATE_PREFIX: &str = "codex-telegram-bridge";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -102,14 +107,14 @@ impl Config {
 
         let mut config = if value.get("telegram").is_some() && value.get("codex").is_some() {
             toml::from_str::<Self>(&raw)
-                .with_context(|| format!("invalid bridge TOML in {}", path.display()))?
+                .with_context(|| format!("invalid codex-bot TOML in {}", path.display()))?
         } else if value.get("projects").is_some() {
             let legacy: LegacyRoot = toml::from_str(&raw)
                 .with_context(|| format!("invalid cc-connect TOML in {}", path.display()))?;
             Config::from_legacy(path, legacy, selected_project)?
         } else {
             bail!(
-                "unsupported config format in {}: expected bridge config or cc-connect [[projects]]",
+                "unsupported config format in {}: expected codex-bot config or cc-connect [[projects]]",
                 path.display()
             );
         };
@@ -132,9 +137,9 @@ impl Config {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        normalize_path(
-            Some(&base_dir),
-            Path::new("codex-telegram-bridge-state.json"),
+        prefer_existing_legacy_path(
+            normalize_path(Some(&base_dir), Path::new(DEFAULT_STATE_FILE_NAME)),
+            normalize_path(Some(&base_dir), Path::new(LEGACY_DEFAULT_STATE_FILE_NAME)),
         )
     }
 
@@ -170,7 +175,7 @@ impl Config {
 
         if !project.agent.kind.eq_ignore_ascii_case("codex") {
             bail!(
-                "project {:?} uses agent {:?}, but this bridge only supports codex",
+                "project {:?} uses agent {:?}, but codex-bot only supports codex",
                 project.name,
                 project.agent.kind
             );
@@ -233,19 +238,29 @@ fn normalize_path(base_dir: Option<&Path>, path: &Path) -> PathBuf {
 }
 
 fn legacy_state_path(config_path: &Path, data_dir: Option<&str>, project_name: &str) -> PathBuf {
-    let file_name = format!(
-        "codex-telegram-bridge-{}.json",
-        sanitize_project_name(project_name)
-    );
-    if let Some(dir) = data_dir.filter(|value| !value.trim().is_empty()) {
-        return normalize_path(config_path.parent(), Path::new(dir)).join(file_name);
-    }
+    let suffix = sanitize_project_name(project_name);
+    let base_dir = if let Some(dir) = data_dir.filter(|value| !value.trim().is_empty()) {
+        normalize_path(config_path.parent(), Path::new(dir))
+    } else {
+        config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    prefer_existing_legacy_path(
+        base_dir.join(format!(
+            "{DEFAULT_LEGACY_PROJECT_STATE_PREFIX}-{suffix}.json"
+        )),
+        base_dir.join(format!("{LEGACY_PROJECT_STATE_PREFIX}-{suffix}.json")),
+    )
+}
 
-    let base_dir = config_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base_dir.join(file_name)
+fn prefer_existing_legacy_path(primary: PathBuf, legacy: PathBuf) -> PathBuf {
+    if !primary.exists() && legacy.exists() {
+        legacy
+    } else {
+        primary
+    }
 }
 
 fn sanitize_project_name(name: &str) -> String {
@@ -352,7 +367,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::Config;
+    use super::{Config, LEGACY_DEFAULT_STATE_FILE_NAME};
 
     #[test]
     fn load_native_config_normalizes_empty_log_level() {
@@ -406,5 +421,63 @@ level = ""
 
         let config = Config::load(&config_path, None).expect("load config");
         assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn default_state_path_prefers_existing_legacy_filename() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[telegram]
+token = "123"
+
+[codex]
+work_dir = "./work"
+"#,
+        )
+        .expect("write config");
+        let legacy_state_path = temp_dir.path().join(LEGACY_DEFAULT_STATE_FILE_NAME);
+        fs::write(&legacy_state_path, "{}").expect("write legacy state");
+
+        let config = Config::load(&config_path, None).expect("load config");
+        assert_eq!(config.default_state_path(&config_path), legacy_state_path);
+    }
+
+    #[test]
+    fn legacy_state_path_prefers_existing_legacy_filename() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[projects]]
+name = "demo project"
+
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "./work"
+
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+token = "123"
+"#,
+        )
+        .expect("write config");
+        let legacy_state_path = temp_dir
+            .path()
+            .join("codex-telegram-bridge-demo_project.json");
+        fs::write(&legacy_state_path, "{}").expect("write legacy state");
+
+        let config = Config::load(&config_path, None).expect("load config");
+        assert_eq!(
+            config.state_path.as_deref(),
+            Some(legacy_state_path.as_path())
+        );
     }
 }

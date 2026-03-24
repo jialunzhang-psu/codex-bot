@@ -74,7 +74,11 @@ impl TelegramClient {
 
         Ok(Self {
             http: Client::builder()
-                .user_agent("codex-telegram-bridge/0.1.0")
+                .user_agent(concat!(
+                    env!("CARGO_PKG_NAME"),
+                    "/",
+                    env!("CARGO_PKG_VERSION")
+                ))
                 .build()
                 .context("failed to build HTTP client")?,
             api_base: format!("https://api.telegram.org/bot{token}"),
