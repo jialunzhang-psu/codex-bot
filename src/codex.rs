@@ -46,7 +46,7 @@ pub struct RuntimeSettings {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionSummary {
+pub struct CodexSessionSummary {
     pub id: String,
     pub display_name: Option<String>,
     pub summary: String,
@@ -364,7 +364,7 @@ impl CodexClient {
         })
     }
 
-    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+    pub fn list_codex_sessions(&self) -> Result<Vec<CodexSessionSummary>> {
         list_sessions_in(&self.work_dir, &self.codex_home()?)
     }
 
@@ -388,8 +388,12 @@ impl CodexClient {
         crate::accounts::remove_all_accounts(&self.codex_home()?)
     }
 
-    pub fn get_session_history(&self, session_id: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
-        get_session_history_in(session_id, limit, &self.codex_home()?)
+    pub fn get_codex_session_history(
+        &self,
+        codex_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>> {
+        get_session_history_in(codex_session_id, limit, &self.codex_home()?)
     }
 
     pub async fn get_all_usage(&self) -> Result<PoolUsageReport> {
@@ -476,8 +480,8 @@ impl CodexClient {
         })
     }
 
-    pub fn delete_session(&self, session_id: &str) -> Result<()> {
-        delete_session_artifacts_in(&self.codex_home()?, session_id)
+    pub fn delete_codex_session(&self, codex_session_id: &str) -> Result<()> {
+        delete_session_artifacts_in(&self.codex_home()?, codex_session_id)
     }
 
     pub async fn login_status(&self) -> Result<AuthStatus> {
@@ -805,7 +809,7 @@ fn path_prefix_len(prefix: &Path, path: &Path) -> Option<usize> {
     }
 }
 
-fn list_sessions_in(work_dir: &Path, codex_home: &Path) -> Result<Vec<SessionSummary>> {
+fn list_sessions_in(work_dir: &Path, codex_home: &Path) -> Result<Vec<CodexSessionSummary>> {
     let work_dir = normalize_path(work_dir)?;
     let store = CodexStore::from_home(codex_home.to_path_buf())?;
     let sessions_dir = sessions_root_in(codex_home);
@@ -930,7 +934,7 @@ fn get_session_history_in(
     Ok(entries)
 }
 
-fn parse_session_file(path: &Path, filter_cwd: &Path) -> Result<Option<SessionSummary>> {
+fn parse_session_file(path: &Path, filter_cwd: &Path) -> Result<Option<CodexSessionSummary>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to open session transcript {}", path.display()))?;
     let metadata = file
@@ -1004,7 +1008,7 @@ fn parse_session_file(path: &Path, filter_cwd: &Path) -> Result<Option<SessionSu
         }
     }
 
-    Ok(Some(SessionSummary {
+    Ok(Some(CodexSessionSummary {
         id: session_id,
         display_name,
         summary,

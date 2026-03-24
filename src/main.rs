@@ -103,7 +103,7 @@ async fn run_bridge(
         config.default_runtime_settings(),
     )?);
     info!("fetching Telegram bot identity");
-    let app = BridgeApp::new(config, telegram, state, codex).await?;
+    let app = Arc::new(BridgeApp::new(config, telegram, state, codex).await?);
     app.run().await
 }
 

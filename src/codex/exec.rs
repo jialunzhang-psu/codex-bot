@@ -19,13 +19,13 @@ use super::{
 pub enum TurnEvent {
     Status(String),
     FinalText(String),
-    ThreadId,
+    CodexSessionId,
     Error(String),
 }
 
 #[derive(Debug)]
 pub struct TurnOutcome {
-    pub thread_id: Option<String>,
+    pub codex_session_id: Option<String>,
     pub final_text: Option<String>,
 }
 
@@ -37,7 +37,7 @@ pub struct SpawnedTurn {
 
 #[derive(Default)]
 struct EventParser {
-    thread_id: Option<String>,
+    codex_session_id: Option<String>,
     pending_messages: Vec<String>,
     final_text: Option<String>,
     fatal_error: Option<String>,
@@ -46,7 +46,7 @@ struct EventParser {
 impl CodexClient {
     pub fn spawn_turn(
         &self,
-        thread_id: Option<&str>,
+        codex_session_id: Option<&str>,
         settings: &RuntimeSettings,
         prompt: &str,
         cancel: CancellationToken,
@@ -55,7 +55,7 @@ impl CodexClient {
             bail!("prompt is empty");
         }
 
-        let args = build_exec_args(&self.work_dir, thread_id, settings, prompt);
+        let args = build_exec_args(&self.work_dir, codex_session_id, settings, prompt);
         let mut command = self.command();
         command
             .args(&args)
@@ -147,10 +147,10 @@ impl CodexClient {
 
                 drop(tx);
 
-                if let (Some(thread_id), Some(codex_home)) =
-                    (&parser.thread_id, codex_home.as_deref())
+                if let (Some(codex_session_id), Some(codex_home)) =
+                    (&parser.codex_session_id, codex_home.as_deref())
                 {
-                    let _ = patch_session_source_in(codex_home, thread_id);
+                    let _ = patch_session_source_in(codex_home, codex_session_id);
                 }
 
                 if cancel.is_cancelled() {
@@ -171,7 +171,7 @@ impl CodexClient {
                 }
 
                 Ok(TurnOutcome {
-                    thread_id: parser.thread_id,
+                    codex_session_id: parser.codex_session_id,
                     final_text: parser.final_text,
                 })
             })
@@ -195,9 +195,9 @@ impl EventParser {
             "thread.started" => raw
                 .get("thread_id")
                 .and_then(Value::as_str)
-                .map(|thread_id| {
-                    self.thread_id = Some(thread_id.to_string());
-                    vec![TurnEvent::ThreadId]
+                .map(|codex_session_id| {
+                    self.codex_session_id = Some(codex_session_id.to_string());
+                    vec![TurnEvent::CodexSessionId]
                 })
                 .unwrap_or_default(),
             "turn.started" => {
@@ -290,11 +290,11 @@ impl EventParser {
 
 fn build_exec_args(
     work_dir: &Path,
-    thread_id: Option<&str>,
+    codex_session_id: Option<&str>,
     settings: &RuntimeSettings,
     prompt: &str,
 ) -> Vec<String> {
-    let mut args = if thread_id.is_some() {
+    let mut args = if codex_session_id.is_some() {
         vec![
             "exec".to_string(),
             "resume".to_string(),
@@ -319,8 +319,8 @@ fn build_exec_args(
         args.push(format!("model_reasoning_effort={effort:?}"));
     }
 
-    if let Some(thread_id) = thread_id {
-        args.push(thread_id.to_string());
+    if let Some(codex_session_id) = codex_session_id {
+        args.push(codex_session_id.to_string());
         args.push("--json".to_string());
         args.push(prompt.to_string());
     } else {

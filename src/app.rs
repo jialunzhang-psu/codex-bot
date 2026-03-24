@@ -13,9 +13,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::codex::{
-    AddAccountResult, CodexClient, DeviceAuthPrompt, LoginEvent, PoolAccountView, PoolList,
-    PoolUsageReport, ReviewRequest, RuntimeSettings, SessionSummary, SpawnedReview, SpawnedTurn,
-    StoredAccount, TurnEvent, TurnOutcome, UsageReport,
+    AddAccountResult, CodexClient, CodexSessionSummary, DeviceAuthPrompt, LoginEvent,
+    PoolAccountView, PoolList, PoolUsageReport, ReviewRequest, RuntimeSettings, SpawnedReview,
+    SpawnedTurn, StoredAccount, TurnEvent, TurnOutcome, UsageReport,
 };
 use crate::config::Config;
 use crate::state::StateStore;
@@ -69,7 +69,7 @@ struct ActiveLogin {
 
 #[derive(Debug, Clone)]
 struct MessageContext {
-    session_key: String,
+    bot_session_key: String,
     chat_id: i64,
     message_id: i64,
     chat_kind: String,
@@ -123,7 +123,7 @@ impl BridgeApp {
         })
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(self: &Arc<Self>) -> Result<()> {
         self.telegram.set_my_commands(&menu_commands()).await?;
         info!(
             bot = %self.bot.username,
@@ -156,7 +156,7 @@ impl BridgeApp {
         }
     }
 
-    async fn handle_message(&self, message: Message) -> Result<()> {
+    async fn handle_message(self: &Arc<Self>, message: Message) -> Result<()> {
         if message.date < self.startup_unix.saturating_sub(5) {
             return Ok(());
         }
@@ -185,7 +185,7 @@ impl BridgeApp {
 
         let text = strip_bot_mentions(text, &self.bot.username);
         let context = MessageContext {
-            session_key: self.session_key(&message, from.id),
+            bot_session_key: self.bot_session_key(&message, from.id),
             chat_id: message.chat.id,
             message_id: message.message_id,
             chat_kind: message.chat.kind.clone(),
@@ -204,7 +204,11 @@ impl BridgeApp {
         Ok(())
     }
 
-    async fn handle_command(&self, context: &MessageContext, command: ParsedCommand) -> Result<()> {
+    async fn handle_command(
+        self: &Arc<Self>,
+        context: &MessageContext,
+        command: ParsedCommand,
+    ) -> Result<()> {
         match command.name.as_str() {
             "start" | "help" => self.reply_text(context, &help_text()).await?,
             "new" => self.cmd_new(context, command.args).await?,
@@ -242,8 +246,8 @@ impl BridgeApp {
         Ok(())
     }
 
-    async fn handle_prompt(&self, context: &MessageContext) -> Result<()> {
-        if self.active_run(&context.session_key).is_some() {
+    async fn handle_prompt(self: &Arc<Self>, context: &MessageContext) -> Result<()> {
+        if self.active_run(&context.bot_session_key).is_some() {
             self.reply_text(
                 context,
                 "A Codex request is already running for this chat. Wait for it to finish or use /stop.",
@@ -252,7 +256,7 @@ impl BridgeApp {
             return Ok(());
         }
 
-        let session = self.state.session(&context.session_key);
+        let bot_session = self.state.bot_session(&context.bot_session_key);
         let settings = self.state.runtime_settings();
         let cancel = CancellationToken::new();
         let preview = self
@@ -260,7 +264,7 @@ impl BridgeApp {
             .send_message(context.chat_id, "Processing...", Some(context.message_id))
             .await?;
         let spawned = match self.codex.spawn_turn(
-            session.thread_id.as_deref(),
+            bot_session.codex_session_id.as_deref(),
             &settings,
             &context.text,
             cancel.clone(),
@@ -274,36 +278,51 @@ impl BridgeApp {
         };
 
         let run_id = self.register_run(
-            &context.session_key,
+            &context.bot_session_key,
             RunKind::Prompt,
             cancel.clone(),
             spawned.pid.load(Ordering::Relaxed),
         );
         let typing_task = self.spawn_typing_task(context.chat_id, cancel.clone());
-        let result = self.collect_turn_output(context, preview, spawned).await;
-        cancel.cancel();
-        typing_task.abort();
-        self.finish_run(&context.session_key, run_id);
+        let app = Arc::clone(self);
+        let context = context.clone();
+        let generation = bot_session.generation;
+        tokio::spawn(async move {
+            let result = app.collect_turn_output(&context, preview, spawned).await;
+            cancel.cancel();
+            typing_task.abort();
+            app.finish_run(&context.bot_session_key, run_id);
 
-        match result {
-            Ok(outcome) => {
-                if let Some(thread_id) = &outcome.thread_id {
-                    let _ = self.state.assign_thread_if_generation(
-                        &context.session_key,
-                        session.generation,
-                        thread_id,
-                    )?;
+            match result {
+                Ok(outcome) => {
+                    if let Some(codex_session_id) = &outcome.codex_session_id {
+                        if let Err(err) = app.state.assign_codex_session_if_generation(
+                            &context.bot_session_key,
+                            generation,
+                            codex_session_id,
+                        ) {
+                            warn!(
+                                bot_session = %context.bot_session_key,
+                                error = %err,
+                                "failed to persist generated codex session id"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(bot_session = %context.bot_session_key, error = %err, "prompt failed");
                 }
             }
-            Err(err) => {
-                warn!(session = %context.session_key, error = %err, "prompt failed");
-            }
-        }
+        });
 
         Ok(())
     }
 
-    async fn cmd_review(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
+    async fn cmd_review(
+        self: &Arc<Self>,
+        context: &MessageContext,
+        args: Vec<String>,
+    ) -> Result<()> {
         if !self.auth_commands_allowed(context) {
             self.reply_text(
                 context,
@@ -313,7 +332,7 @@ impl BridgeApp {
             return Ok(());
         }
 
-        if self.active_run(&context.session_key).is_some() {
+        if self.active_run(&context.bot_session_key).is_some() {
             self.reply_text(
                 context,
                 "A Codex request is already running for this chat. Wait for it to finish or use /stop.",
@@ -351,22 +370,26 @@ impl BridgeApp {
         };
 
         let run_id = self.register_run(
-            &context.session_key,
+            &context.bot_session_key,
             RunKind::Review,
             cancel.clone(),
             spawned.pid.load(Ordering::Relaxed),
         );
         let typing_task = self.spawn_typing_task(context.chat_id, cancel.clone());
-        let result = self.collect_review_output(context, preview, spawned).await;
-        cancel.cancel();
-        typing_task.abort();
-        self.finish_run(&context.session_key, run_id);
+        let app = Arc::clone(self);
+        let context = context.clone();
+        tokio::spawn(async move {
+            let result = app.collect_review_output(&context, preview, spawned).await;
+            cancel.cancel();
+            typing_task.abort();
+            app.finish_run(&context.bot_session_key, run_id);
 
-        if let Err(err) = &result {
-            warn!(session = %context.session_key, error = %err, "review failed");
-        }
+            if let Err(err) = &result {
+                warn!(bot_session = %context.bot_session_key, error = %err, "review failed");
+            }
+        });
 
-        result
+        Ok(())
     }
 
     async fn collect_turn_output(
@@ -377,7 +400,7 @@ impl BridgeApp {
     ) -> Result<TurnOutcome> {
         let mut last_status = "Processing...".to_string();
         let mut final_text: Option<String> = None;
-        let quiet = self.state.session(&context.session_key).quiet;
+        let quiet = self.state.bot_session(&context.bot_session_key).quiet;
 
         while let Some(event) = spawned.events.recv().await {
             match event {
@@ -397,7 +420,7 @@ impl BridgeApp {
                 TurnEvent::FinalText(text) => {
                     final_text = Some(text);
                 }
-                TurnEvent::ThreadId => {}
+                TurnEvent::CodexSessionId => {}
                 TurnEvent::Error(message) => {
                     let next_status = format!("Error: {}", truncate_text(&message, 2000));
                     let _ = self
@@ -530,25 +553,26 @@ impl BridgeApp {
 
     async fn cmd_new(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
         let pending_name = join_args(args);
-        let busy = self.active_run(&context.session_key);
+        let busy = self.active_run(&context.bot_session_key);
         self.state
-            .reset_session(&context.session_key, pending_name.clone())?;
+            .reset_bot_session(&context.bot_session_key, pending_name.clone())?;
 
         if let Some(run) = busy {
             run.cancel.cancel();
             self.reply_text(
                 context,
-                "Session reset requested. The current run is stopping; send your next message after it exits.",
+                "Bot session reset requested. The current run is stopping; send your next message after it exits.",
             )
             .await?;
             return Ok(());
         }
 
         if let Some(name) = pending_name {
-            self.reply_text(context, &format!("Started a new session: {name}"))
+            self.reply_text(context, &format!("Started a new bot session: {name}"))
                 .await?;
         } else {
-            self.reply_text(context, "Started a new session.").await?;
+            self.reply_text(context, "Started a new bot session.")
+                .await?;
         }
         Ok(())
     }
@@ -559,35 +583,38 @@ impl BridgeApp {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(1);
-        let sessions = self.codex.list_sessions()?;
-        if sessions.is_empty() {
+        let codex_sessions = self.codex.list_codex_sessions()?;
+        if codex_sessions.is_empty() {
             self.reply_text(context, "No Codex sessions were found for this workdir.")
                 .await?;
             return Ok(());
         }
 
-        let current = self.state.session(&context.session_key).thread_id;
-        let names = self.state.all_thread_names();
-        let total_pages = sessions.len().div_ceil(PAGE_SIZE);
+        let current = self
+            .state
+            .bot_session(&context.bot_session_key)
+            .codex_session_id;
+        let names = self.state.all_codex_session_names();
+        let total_pages = codex_sessions.len().div_ceil(PAGE_SIZE);
         let page = page.min(total_pages.max(1));
         let start = (page - 1) * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(sessions.len());
+        let end = (start + PAGE_SIZE).min(codex_sessions.len());
 
         let mut lines = Vec::new();
         lines.push(format!(
             "Codex sessions for {}\nPage {page}/{total_pages}",
             self.codex.work_dir().display()
         ));
-        for (index, session) in sessions[start..end].iter().enumerate() {
+        for (index, codex_session) in codex_sessions[start..end].iter().enumerate() {
             let absolute_index = start + index + 1;
-            let marker = if current.as_deref() == Some(session.id.as_str()) {
+            let marker = if current.as_deref() == Some(codex_session.id.as_str()) {
                 "*"
             } else {
                 " "
             };
-            let display = session_display_name(session, &names);
-            let modified = format_time(session.modified_at);
-            let prompt = session.summary.trim();
+            let display = codex_session_display_name(codex_session, &names);
+            let modified = format_time(codex_session.modified_at);
+            let prompt = codex_session.summary.trim();
             let prompt_suffix = if prompt.is_empty()
                 || display.contains(prompt)
                 || prompt.contains(display.as_str())
@@ -598,12 +625,12 @@ impl BridgeApp {
             };
             lines.push(format!(
                 "{marker} {absolute_index}. {display} [{id}] msgs={msgs} updated={modified}{prompt_suffix}",
-                id = short_id(&session.id),
-                msgs = session.message_count
+                id = short_id(&codex_session.id),
+                msgs = codex_session.message_count
             ));
         }
         lines.push(
-            "Use /switch <number|id|name> to switch, or /remove <number|id|name> to delete."
+            "Use /switch <number|id|name> to bind this bot session to another Codex session, or /remove <number|id|name> to delete one."
                 .to_string(),
         );
         self.reply_text(context, &lines.join("\n")).await?;
@@ -618,24 +645,24 @@ impl BridgeApp {
         }
 
         let query = args.join(" ");
-        let sessions = self.codex.list_sessions()?;
-        let names = self.state.all_thread_names();
-        let Some(matched) = match_session(&sessions, &names, &query) else {
-            self.reply_text(context, &format!("No session matched: {query}"))
+        let codex_sessions = self.codex.list_codex_sessions()?;
+        let names = self.state.all_codex_session_names();
+        let Some(matched) = match_codex_session(&codex_sessions, &names, &query) else {
+            self.reply_text(context, &format!("No Codex session matched: {query}"))
                 .await?;
             return Ok(());
         };
 
-        let busy = self.active_run(&context.session_key);
+        let busy = self.active_run(&context.bot_session_key);
         self.state
-            .switch_session(&context.session_key, matched.id.clone())?;
+            .switch_bot_session_to_codex_session(&context.bot_session_key, matched.id.clone())?;
         if let Some(run) = busy {
             run.cancel.cancel();
             self.reply_text(
                 context,
                 &format!(
-                    "Switched to {}. The current run is stopping; your next prompt will use the new session.",
-                    session_display_name(matched, &names)
+                    "Bound this bot session to {}. The current run is stopping; your next prompt will use the new Codex session.",
+                    codex_session_display_name(matched, &names)
                 ),
             )
             .await?;
@@ -644,37 +671,48 @@ impl BridgeApp {
 
         self.reply_text(
             context,
-            &format!("Switched to {}.", session_display_name(matched, &names)),
+            &format!(
+                "Bound this bot session to {}.",
+                codex_session_display_name(matched, &names)
+            ),
         )
         .await?;
         Ok(())
     }
 
     async fn cmd_current(&self, context: &MessageContext) -> Result<()> {
-        let session = self.state.session(&context.session_key);
-        if let Some(thread_id) = session.thread_id {
-            let names = self.state.all_thread_names();
+        let bot_session = self.state.bot_session(&context.bot_session_key);
+        if let Some(codex_session_id) = bot_session.codex_session_id {
+            let names = self.state.all_codex_session_names();
             let name = names
-                .get(&thread_id)
+                .get(&codex_session_id)
                 .cloned()
-                .unwrap_or_else(|| short_id(&thread_id).to_string());
+                .unwrap_or_else(|| short_id(&codex_session_id).to_string());
             self.reply_text(
                 context,
-                &format!("Current session: {name} ({})", short_id(&thread_id)),
+                &format!(
+                    "Current Codex session for this bot session: {name} ({})",
+                    short_id(&codex_session_id)
+                ),
             )
             .await?;
             return Ok(());
         }
 
-        if let Some(name) = session.pending_name {
+        if let Some(name) = bot_session.pending_name {
             self.reply_text(
                 context,
-                &format!("Current session is fresh and will be named: {name}"),
+                &format!(
+                    "Current bot session is fresh and its next Codex session will be named: {name}"
+                ),
             )
             .await?;
         } else {
-            self.reply_text(context, "No active Codex session is selected yet.")
-                .await?;
+            self.reply_text(
+                context,
+                "No Codex session is currently bound to this bot session.",
+            )
+            .await?;
         }
         Ok(())
     }
@@ -686,14 +724,20 @@ impl BridgeApp {
             .filter(|value| *value > 0)
             .unwrap_or(10)
             .min(50);
-        let session = self.state.session(&context.session_key);
-        let Some(thread_id) = session.thread_id else {
-            self.reply_text(context, "No active Codex session is selected yet.")
-                .await?;
+        let bot_session = self.state.bot_session(&context.bot_session_key);
+        let Some(codex_session_id) = bot_session.codex_session_id else {
+            self.reply_text(
+                context,
+                "No Codex session is currently bound to this bot session.",
+            )
+            .await?;
             return Ok(());
         };
 
-        let entries = match self.codex.get_session_history(&thread_id, limit) {
+        let entries = match self
+            .codex
+            .get_codex_session_history(&codex_session_id, limit)
+        {
             Ok(entries) => entries,
             Err(err) => {
                 self.reply_text(context, &format!("Failed to load history: {err}"))
@@ -702,8 +746,11 @@ impl BridgeApp {
             }
         };
         if entries.is_empty() {
-            self.reply_text(context, "No history is available for the current session.")
-                .await?;
+            self.reply_text(
+                context,
+                "No history is available for the current Codex session.",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -1102,7 +1149,7 @@ impl BridgeApp {
     }
 
     async fn cmd_quiet(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
-        let current = self.state.session(&context.session_key);
+        let current = self.state.bot_session(&context.bot_session_key);
         let next = match args.first().map(|value| value.to_ascii_lowercase()) {
             Some(value) if matches!(value.as_str(), "on" | "true" | "1") => true,
             Some(value) if matches!(value.as_str(), "off" | "false" | "0") => false,
@@ -1114,11 +1161,12 @@ impl BridgeApp {
             None => !current.quiet,
         };
 
-        self.state.set_quiet(&context.session_key, next)?;
+        self.state
+            .set_bot_session_quiet(&context.bot_session_key, next)?;
         let text = if next {
-            "Quiet mode ON. Thinking and tool progress messages are hidden for this chat."
+            "Quiet mode ON. Thinking and tool progress messages are hidden for this bot session."
         } else {
-            "Quiet mode OFF. Thinking and tool progress messages are visible for this chat."
+            "Quiet mode OFF. Thinking and tool progress messages are visible for this bot session."
         };
         self.reply_text(context, text).await?;
         Ok(())
@@ -1132,48 +1180,51 @@ impl BridgeApp {
         }
 
         let query = args.join(" ");
-        let sessions = self.codex.list_sessions()?;
-        let names = self.state.all_thread_names();
-        let Some(matched) = match_session(&sessions, &names, &query) else {
-            self.reply_text(context, &format!("No session matched: {query}"))
+        let codex_sessions = self.codex.list_codex_sessions()?;
+        let names = self.state.all_codex_session_names();
+        let Some(matched) = match_codex_session(&codex_sessions, &names, &query) else {
+            self.reply_text(context, &format!("No Codex session matched: {query}"))
                 .await?;
             return Ok(());
         };
 
-        let active_thread = self.state.session(&context.session_key).thread_id;
-        if active_thread.as_deref() == Some(matched.id.as_str()) {
+        let active_codex_session = self
+            .state
+            .bot_session(&context.bot_session_key)
+            .codex_session_id;
+        if active_codex_session.as_deref() == Some(matched.id.as_str()) {
             self.reply_text(
                 context,
-                "Cannot remove the current active session. Switch away from it or use /new first.",
+                "Cannot remove the Codex session currently bound to this bot session. Switch away from it or use /new first.",
             )
             .await?;
             return Ok(());
         }
 
-        let display = session_display_name(matched, &names);
-        if let Err(err) = self.codex.delete_session(&matched.id) {
-            self.reply_text(context, &format!("Failed to remove session: {err}"))
+        let display = codex_session_display_name(matched, &names);
+        if let Err(err) = self.codex.delete_codex_session(&matched.id) {
+            self.reply_text(context, &format!("Failed to remove Codex session: {err}"))
                 .await?;
             return Err(err);
         }
-        self.state.remove_thread_everywhere(&matched.id)?;
-        self.reply_text(context, &format!("Removed session: {display}"))
+        self.state.remove_codex_session_everywhere(&matched.id)?;
+        self.reply_text(context, &format!("Removed Codex session: {display}"))
             .await?;
         Ok(())
     }
 
     async fn cmd_status(&self, context: &MessageContext) -> Result<()> {
-        let session = self.state.session(&context.session_key);
+        let bot_session = self.state.bot_session(&context.bot_session_key);
         let runtime = self.state.runtime_settings();
         let effective = self.codex.effective_settings(&runtime)?;
-        let running = self.active_run(&context.session_key);
+        let running = self.active_run(&context.bot_session_key);
         let login = self.active_login();
-        let current = session
-            .thread_id
+        let current = bot_session
+            .codex_session_id
             .as_deref()
             .map(short_id)
             .unwrap_or("(fresh)");
-        let pending_name = session.pending_name.unwrap_or_else(|| "-".to_string());
+        let pending_name = bot_session.pending_name.unwrap_or_else(|| "-".to_string());
         let running_text = running
             .map(|run| {
                 format!(
@@ -1195,7 +1246,7 @@ impl BridgeApp {
             .unwrap_or_else(|| "idle".to_string());
 
         let text = format!(
-            "Bot: @{bot}\nUser: {user}\nUser ID: {user_id}\nChat: {chat}\nSession key: {session_key}\nWorkdir: {workdir}\nCodex home: {codex_home}\nMode: {mode}\nModel: {model}\nReasoning: {reasoning}\nQuiet: {quiet}\nActive thread: {current}\nPending name: {pending_name}\nRunning: {running}\nAccount flow: {login}",
+            "Bot: @{bot}\nUser: {user}\nUser ID: {user_id}\nChat: {chat}\nBot session key: {bot_session_key}\nWorkdir: {workdir}\nCodex home: {codex_home}\nMode: {mode}\nModel: {model}\nReasoning: {reasoning}\nQuiet: {quiet}\nActive Codex session: {current}\nPending Codex session name: {pending_name}\nRunning: {running}\nAccount flow: {login}",
             bot = self.bot.username,
             user = context.user_name,
             user_id = context.user_id,
@@ -1203,13 +1254,13 @@ impl BridgeApp {
                 .chat_name
                 .clone()
                 .unwrap_or_else(|| context.chat_id.to_string()),
-            session_key = context.session_key,
+            bot_session_key = context.bot_session_key,
             workdir = self.codex.work_dir().display(),
             codex_home = effective.codex_home.display(),
             mode = runtime.mode,
             model = format_effective_value(effective.model),
             reasoning = format_effective_value(effective.reasoning_effort),
-            quiet = if session.quiet { "on" } else { "off" },
+            quiet = if bot_session.quiet { "on" } else { "off" },
             running = running_text,
             login = login_text,
         );
@@ -1314,7 +1365,7 @@ impl BridgeApp {
     }
 
     async fn cmd_stop(&self, context: &MessageContext) -> Result<()> {
-        if let Some(run) = self.active_run(&context.session_key) {
+        if let Some(run) = self.active_run(&context.bot_session_key) {
             run.cancel.cancel();
             self.reply_text(context, run.kind.stop_text()).await?;
         } else {
@@ -1335,14 +1386,14 @@ impl BridgeApp {
 
     fn register_run(
         &self,
-        session_key: &str,
+        bot_session_key: &str,
         kind: RunKind,
         cancel: CancellationToken,
         pid: u32,
     ) -> u64 {
         let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         self.active_runs.lock().insert(
-            session_key.to_string(),
+            bot_session_key.to_string(),
             ActiveRun {
                 run_id,
                 kind,
@@ -1354,18 +1405,18 @@ impl BridgeApp {
         run_id
     }
 
-    fn finish_run(&self, session_key: &str, run_id: u64) {
+    fn finish_run(&self, bot_session_key: &str, run_id: u64) {
         let mut active_runs = self.active_runs.lock();
         let should_remove = active_runs
-            .get(session_key)
+            .get(bot_session_key)
             .is_some_and(|active| active.run_id == run_id);
         if should_remove {
-            active_runs.remove(session_key);
+            active_runs.remove(bot_session_key);
         }
     }
 
-    fn active_run(&self, session_key: &str) -> Option<ActiveRun> {
-        self.active_runs.lock().get(session_key).cloned()
+    fn active_run(&self, bot_session_key: &str) -> Option<ActiveRun> {
+        self.active_runs.lock().get(bot_session_key).cloned()
     }
 
     fn register_login(
@@ -1401,7 +1452,7 @@ impl BridgeApp {
         context.chat_kind == "private"
     }
 
-    fn session_key(&self, message: &Message, user_id: i64) -> String {
+    fn bot_session_key(&self, message: &Message, user_id: i64) -> String {
         if self.config.telegram.share_session_in_channel {
             format!("telegram:{}", message.chat.id)
         } else {
@@ -1485,10 +1536,10 @@ fn strip_bot_mentions(text: &str, bot_username: &str) -> String {
 fn help_text() -> String {
     [
         "/help - Show this help",
-        "/new [name] - Start a fresh session",
+        "/new [name] - Start a fresh bot session",
         "/list [page] - List Codex sessions in this workdir",
-        "/switch <number|id|name> - Switch to a previous session",
-        "/history [n] - Show recent messages for the current session",
+        "/switch <number|id|name> - Bind this bot session to a Codex session",
+        "/history [n] - Show recent messages for the current Codex session",
         "/review [notes] - Review uncommitted changes",
         "/review base <branch> [notes] - Review changes against a base branch",
         "/review commit <sha> [notes] - Review a commit",
@@ -1498,9 +1549,9 @@ fn help_text() -> String {
         "/switch-account <number|id|label> - Switch the active Codex account",
         "/remove-account <number|id|label|all> - Remove pooled accounts",
         "/login - Alias for /add-account",
-        "/quiet [on|off] - Toggle progress messages for this chat",
-        "/remove <number|id|name> - Delete a session from local Codex storage",
-        "/current - Show the current session",
+        "/quiet [on|off] - Toggle progress messages for this bot session",
+        "/remove <number|id|name> - Delete a Codex session from local storage",
+        "/current - Show the current Codex session",
         "/status - Show runtime status",
         "/mode [suggest|full-auto|yolo] - Show or set mode",
         "/model [name] - Show or set the Codex model",
@@ -1536,7 +1587,7 @@ fn menu_commands() -> Vec<BotCommand> {
         },
         BotCommand {
             command: "new".to_string(),
-            description: "Start a fresh session".to_string(),
+            description: "Start a fresh bot session".to_string(),
         },
         BotCommand {
             command: "list".to_string(),
@@ -1544,11 +1595,11 @@ fn menu_commands() -> Vec<BotCommand> {
         },
         BotCommand {
             command: "switch".to_string(),
-            description: "Switch to another session".to_string(),
+            description: "Bind to another Codex session".to_string(),
         },
         BotCommand {
             command: "history".to_string(),
-            description: "Show recent session history".to_string(),
+            description: "Show current Codex session history".to_string(),
         },
         BotCommand {
             command: "review".to_string(),
@@ -1580,11 +1631,11 @@ fn menu_commands() -> Vec<BotCommand> {
         },
         BotCommand {
             command: "remove".to_string(),
-            description: "Delete a saved session".to_string(),
+            description: "Delete a saved Codex session".to_string(),
         },
         BotCommand {
             command: "current".to_string(),
-            description: "Show current session".to_string(),
+            description: "Show current Codex session".to_string(),
         },
         BotCommand {
             command: "status".to_string(),
@@ -1613,29 +1664,34 @@ fn display_name(user: &User) -> String {
     user.display_name()
 }
 
-fn session_display_name(session: &SessionSummary, names: &HashMap<String, String>) -> String {
+fn codex_session_display_name(
+    codex_session: &CodexSessionSummary,
+    names: &HashMap<String, String>,
+) -> String {
     names
-        .get(&session.id)
+        .get(&codex_session.id)
         .cloned()
         .filter(|name| !name.trim().is_empty())
         .or_else(|| {
-            session
+            codex_session
                 .display_name
                 .clone()
                 .filter(|name| !name.trim().is_empty())
         })
-        .or_else(|| (!session.summary.trim().is_empty()).then(|| session.summary.clone()))
+        .or_else(|| {
+            (!codex_session.summary.trim().is_empty()).then(|| codex_session.summary.clone())
+        })
         .unwrap_or_else(|| "(empty)".to_string())
 }
 
-fn match_session<'a>(
-    sessions: &'a [SessionSummary],
+fn match_codex_session<'a>(
+    codex_sessions: &'a [CodexSessionSummary],
     names: &'a HashMap<String, String>,
     query: &str,
-) -> Option<&'a SessionSummary> {
+) -> Option<&'a CodexSessionSummary> {
     if let Ok(index) = query.trim().parse::<usize>() {
-        if (1..=sessions.len()).contains(&index) {
-            return sessions.get(index - 1);
+        if (1..=codex_sessions.len()).contains(&index) {
+            return codex_sessions.get(index - 1);
         }
     }
 
@@ -1644,36 +1700,39 @@ fn match_session<'a>(
         return None;
     }
 
-    for session in sessions {
-        let display = session_display_name(session, names);
+    for codex_session in codex_sessions {
+        let display = codex_session_display_name(codex_session, names);
         if display.eq_ignore_ascii_case(query.trim()) {
-            return Some(session);
+            return Some(codex_session);
         }
     }
 
-    for session in sessions {
-        if session.id.starts_with(query) {
-            return Some(session);
+    for codex_session in codex_sessions {
+        if codex_session.id.starts_with(query) {
+            return Some(codex_session);
         }
     }
 
-    for session in sessions {
-        let display = session_display_name(session, names);
+    for codex_session in codex_sessions {
+        let display = codex_session_display_name(codex_session, names);
         if display.to_ascii_lowercase().starts_with(&query_lower) {
-            return Some(session);
+            return Some(codex_session);
         }
     }
 
-    for session in sessions {
-        let display = session_display_name(session, names);
+    for codex_session in codex_sessions {
+        let display = codex_session_display_name(codex_session, names);
         if display.to_ascii_lowercase().contains(&query_lower) {
-            return Some(session);
+            return Some(codex_session);
         }
     }
 
-    sessions
-        .iter()
-        .find(|session| session.summary.to_ascii_lowercase().contains(&query_lower))
+    codex_sessions.iter().find(|codex_session| {
+        codex_session
+            .summary
+            .to_ascii_lowercase()
+            .contains(&query_lower)
+    })
 }
 
 fn format_time(time: SystemTime) -> String {
