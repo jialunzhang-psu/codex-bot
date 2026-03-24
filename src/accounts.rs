@@ -38,6 +38,12 @@ pub struct PoolList {
 }
 
 #[derive(Clone, Debug)]
+pub struct PoolCatalog {
+    pub pool_dir: PathBuf,
+    pub accounts: Vec<StoredAccount>,
+}
+
+#[derive(Clone, Debug)]
 pub struct AddAccountResult {
     pub account: StoredAccount,
     pub created_new: bool,
@@ -106,6 +112,19 @@ pub fn list_accounts(codex_home: &Path) -> Result<PoolList> {
     let pool_dir = pool_dir()?;
     let codex_auth_path = codex_auth_path(codex_home);
     list_accounts_with_paths(&pool_dir, &codex_auth_path)
+}
+
+pub fn list_pool_accounts() -> Result<PoolCatalog> {
+    let pool_dir = pool_dir()?;
+    let manifest = load_manifest_or_default(&manifest_path(&pool_dir))?;
+    Ok(PoolCatalog {
+        pool_dir,
+        accounts: manifest
+            .accounts
+            .iter()
+            .map(stored_account_from_record)
+            .collect(),
+    })
 }
 
 pub fn add_current_account(codex_home: &Path, label: Option<String>) -> Result<AddAccountResult> {

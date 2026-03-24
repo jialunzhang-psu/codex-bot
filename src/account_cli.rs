@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Local};
 use clap::Subcommand;
 
+use crate::accounts::PoolCatalog;
 use crate::codex::{
     AddAccountResult, CodexClient, PoolAccountView, PoolList, PoolUsageReport, StoredAccount,
     UsageCredits, UsageReport,
@@ -31,35 +32,107 @@ pub enum AccountsCommand {
     Usage,
 }
 
+enum AccountScope {
+    Resolved(AccountTarget),
+    Ambiguous(Vec<AccountTarget>),
+}
+
+struct AccountTarget {
+    project_name: Option<String>,
+    codex_home: PathBuf,
+    codex: CodexClient,
+}
+
 pub async fn run(
     config_path: &Path,
     selected_project: Option<&str>,
     command: AccountsCommand,
 ) -> Result<()> {
-    let discovered_projects = Config::discover_projects(config_path)?;
-    if selected_project.is_none() && discovered_projects.len() > 1 {
-        bail!(
-            "multiple projects found in {}. Pass --project for account commands. Available: {}",
-            config_path.display(),
-            discovered_projects.join(", ")
-        );
-    }
-
-    let config = Config::load(config_path, selected_project)?;
-    let codex = CodexClient::new(&config.codex);
+    let scope = resolve_account_scope(config_path, selected_project)?;
 
     match command {
-        AccountsCommand::List => list_accounts(&codex),
-        AccountsCommand::Add { label } => add_current_account(&codex, label),
-        AccountsCommand::Login { label } => login_and_add_account(&codex, label).await,
-        AccountsCommand::Switch { account } => switch_account(&codex, &account),
-        AccountsCommand::Remove { account, all } => remove_account(&codex, account, all),
-        AccountsCommand::Usage => show_usage(&codex).await,
+        AccountsCommand::List => list_accounts(&scope),
+        AccountsCommand::Add { label } => {
+            add_current_account(require_target(&scope, "add")?, label)
+        }
+        AccountsCommand::Login { label } => {
+            login_and_add_account(require_target(&scope, "login")?, label).await
+        }
+        AccountsCommand::Switch { account } => {
+            switch_account(require_target(&scope, "switch")?, &account)
+        }
+        AccountsCommand::Remove { account, all } => {
+            remove_account(require_target(&scope, "remove")?, account, all)
+        }
+        AccountsCommand::Usage => show_usage(require_target(&scope, "usage")?).await,
     }
 }
 
-fn list_accounts(codex: &CodexClient) -> Result<()> {
-    let list = codex.list_accounts()?;
+fn resolve_account_scope(
+    config_path: &Path,
+    selected_project: Option<&str>,
+) -> Result<AccountScope> {
+    let discovered_projects = Config::discover_projects(config_path)?;
+    if discovered_projects.is_empty()
+        || selected_project.is_some()
+        || discovered_projects.len() == 1
+    {
+        let config = Config::load(config_path, selected_project)?;
+        return Ok(AccountScope::Resolved(account_target_from_config(config)?));
+    }
+
+    let mut targets = Vec::new();
+    let mut unique_homes = Vec::<PathBuf>::new();
+    for project_name in discovered_projects {
+        let config = Config::load(config_path, Some(&project_name))?;
+        let target = account_target_from_config(config)?;
+        if !unique_homes.iter().any(|path| path == &target.codex_home) {
+            unique_homes.push(target.codex_home.clone());
+        }
+        targets.push(target);
+    }
+
+    if unique_homes.len() == 1 {
+        let target = targets
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no codex projects found in {}", config_path.display()))?;
+        Ok(AccountScope::Resolved(target))
+    } else {
+        Ok(AccountScope::Ambiguous(targets))
+    }
+}
+
+fn account_target_from_config(config: Config) -> Result<AccountTarget> {
+    let project_name = config.project_name.clone();
+    let codex = CodexClient::new(&config.codex);
+    let codex_home = codex.codex_home()?;
+    Ok(AccountTarget {
+        project_name,
+        codex_home,
+        codex,
+    })
+}
+
+fn require_target<'a>(scope: &'a AccountScope, command: &str) -> Result<&'a AccountTarget> {
+    match scope {
+        AccountScope::Resolved(target) => Ok(target),
+        AccountScope::Ambiguous(targets) => bail!(
+            "accounts {command} needs --project because your config resolves to multiple CODEX_HOME values:\n{}",
+            format_target_homes(targets)
+        ),
+    }
+}
+
+fn list_accounts(scope: &AccountScope) -> Result<()> {
+    match scope {
+        AccountScope::Resolved(target) => list_accounts_for_target(target),
+        AccountScope::Ambiguous(targets) => list_accounts_global(targets),
+    }
+}
+
+fn list_accounts_for_target(target: &AccountTarget) -> Result<()> {
+    let list = target.codex.list_accounts()?;
     if list.accounts.is_empty() {
         println!(
             "No pooled accounts found in {}.\nUse `accounts login [label]` or `accounts add [label]` to add one.",
@@ -72,23 +145,38 @@ fn list_accounts(codex: &CodexClient) -> Result<()> {
     Ok(())
 }
 
-fn add_current_account(codex: &CodexClient, label: Option<String>) -> Result<()> {
-    let result = codex.add_current_account(label)?;
+fn list_accounts_global(targets: &[AccountTarget]) -> Result<()> {
+    let list = crate::accounts::list_pool_accounts()?;
+    if list.accounts.is_empty() {
+        println!(
+            "No pooled accounts found in {}.\nUse `accounts login [label]` or `accounts add [label]` to add one.\n\nMultiple CODEX_HOME values were detected:\n{}",
+            list.pool_dir.display(),
+            format_target_homes(targets)
+        );
+        return Ok(());
+    }
+
+    println!("{}", format_global_account_list(&list, targets));
+    Ok(())
+}
+
+fn add_current_account(target: &AccountTarget, label: Option<String>) -> Result<()> {
+    let result = target.codex.add_current_account(label)?;
     println!("{}", format_add_account_completion(&result));
     Ok(())
 }
 
-async fn login_and_add_account(codex: &CodexClient, label: Option<String>) -> Result<()> {
-    codex.run_device_login_interactive().await?;
-    let result = codex.add_current_account(label)?;
+async fn login_and_add_account(target: &AccountTarget, label: Option<String>) -> Result<()> {
+    target.codex.run_device_login_interactive().await?;
+    let result = target.codex.add_current_account(label)?;
     println!("{}", format_add_account_completion(&result));
     Ok(())
 }
 
-fn switch_account(codex: &CodexClient, query: &str) -> Result<()> {
-    let list = codex.list_accounts()?;
+fn switch_account(target: &AccountTarget, query: &str) -> Result<()> {
+    let list = target.codex.list_accounts()?;
     let matched = match_account(&list.accounts, query)?;
-    let result = codex.switch_account(&matched.id)?;
+    let result = target.codex.switch_account(&matched.id)?;
     if result.switched {
         println!(
             "Switched active Codex account: {} -> {}.",
@@ -108,9 +196,9 @@ fn switch_account(codex: &CodexClient, query: &str) -> Result<()> {
     Ok(())
 }
 
-fn remove_account(codex: &CodexClient, account: Option<String>, all: bool) -> Result<()> {
+fn remove_account(target: &AccountTarget, account: Option<String>, all: bool) -> Result<()> {
     if all {
-        let result = codex.remove_all_accounts()?;
+        let result = target.codex.remove_all_accounts()?;
         println!(
             "Removed {} pooled account(s). Remaining: {}.",
             result.removed.len(),
@@ -122,9 +210,9 @@ fn remove_account(codex: &CodexClient, account: Option<String>, all: bool) -> Re
     let Some(query) = account else {
         bail!("usage: accounts remove <number|id|label> or accounts remove --all");
     };
-    let list = codex.list_accounts()?;
+    let list = target.codex.list_accounts()?;
     let matched = match_account(&list.accounts, &query)?;
-    let result = codex.remove_account(&matched.id)?;
+    let result = target.codex.remove_account(&matched.id)?;
     println!(
         "Removed account: {}. Was active: {}. Remaining: {}.",
         format_stored_account(&result.account),
@@ -134,8 +222,8 @@ fn remove_account(codex: &CodexClient, account: Option<String>, all: bool) -> Re
     Ok(())
 }
 
-async fn show_usage(codex: &CodexClient) -> Result<()> {
-    let report = codex.get_all_usage().await?;
+async fn show_usage(target: &AccountTarget) -> Result<()> {
+    let report = target.codex.get_all_usage().await?;
     println!("{}", format_pool_usage_report(&report));
     Ok(())
 }
@@ -178,6 +266,40 @@ fn format_account_list(list: &PoolList) -> String {
             .to_string(),
     );
     lines.join("\n")
+}
+
+fn format_global_account_list(list: &PoolCatalog, targets: &[AccountTarget]) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("Codex account pool: {}", list.pool_dir.display()));
+    lines.push("Active auth file: multiple CODEX_HOME values detected".to_string());
+    for (index, account) in list.accounts.iter().enumerate() {
+        lines.push(format!(
+            "  {}. {} added={}",
+            index + 1,
+            format_stored_account(account),
+            format_account_created_at(account.created_ms)
+        ));
+    }
+    lines.push(
+        "Pass `--project <name>` to inspect or modify the active account for one project."
+            .to_string(),
+    );
+    lines.push("Project CODEX_HOME values:".to_string());
+    for line in format_target_homes(targets).lines() {
+        lines.push(line.to_string());
+    }
+    lines.join("\n")
+}
+
+fn format_target_homes(targets: &[AccountTarget]) -> String {
+    targets
+        .iter()
+        .map(|target| {
+            let name = target.project_name.as_deref().unwrap_or("(native config)");
+            format!("- {name}: {}", target.codex_home.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_pool_usage_report(report: &PoolUsageReport) -> String {
@@ -432,4 +554,94 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use anyhow::Result;
+    use tempfile::TempDir;
+
+    use super::{AccountScope, resolve_account_scope};
+
+    #[test]
+    fn resolve_account_scope_collapses_shared_codex_home() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[projects]]
+name = "one"
+[projects.agent]
+type = "codex"
+[projects.agent.options]
+work_dir = "./one"
+extra_env = ["CODEX_HOME=/tmp/shared-codex-home"]
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "1"
+
+[[projects]]
+name = "two"
+[projects.agent]
+type = "codex"
+[projects.agent.options]
+work_dir = "./two"
+extra_env = ["CODEX_HOME=/tmp/shared-codex-home"]
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "2"
+"#,
+        )?;
+
+        assert!(matches!(
+            resolve_account_scope(&config_path, None)?,
+            AccountScope::Resolved(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_account_scope_keeps_distinct_codex_homes_ambiguous() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[projects]]
+name = "one"
+[projects.agent]
+type = "codex"
+[projects.agent.options]
+work_dir = "./one"
+extra_env = ["CODEX_HOME=/tmp/codex-home-one"]
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "1"
+
+[[projects]]
+name = "two"
+[projects.agent]
+type = "codex"
+[projects.agent.options]
+work_dir = "./two"
+extra_env = ["CODEX_HOME=/tmp/codex-home-two"]
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "2"
+"#,
+        )?;
+
+        assert!(matches!(
+            resolve_account_scope(&config_path, None)?,
+            AccountScope::Ambiguous(_)
+        ));
+        Ok(())
+    }
 }
