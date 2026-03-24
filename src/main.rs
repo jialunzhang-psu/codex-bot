@@ -1,3 +1,5 @@
+mod account_cli;
+mod accounts;
 mod app;
 mod codex;
 mod config;
@@ -9,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 use tracing_subscriber::{
@@ -28,6 +30,17 @@ struct Args {
     config: PathBuf,
     #[arg(long, env = "BRIDGE_PROJECT")]
     project: Option<String>,
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    #[command(alias = "account")]
+    Accounts {
+        #[command(subcommand)]
+        command: account_cli::AccountsCommand,
+    },
 }
 
 #[tokio::main]
@@ -42,18 +55,30 @@ async fn main() -> Result<()> {
 
 async fn run(log_handle: reload::Handle<EnvFilter, Registry>) -> Result<()> {
     let args = Args::parse();
-    info!(config = %args.config.display(), "starting codex telegram bridge");
+    match args.command {
+        Some(CliCommand::Accounts { command }) => {
+            account_cli::run(&args.config, args.project.as_deref(), command).await
+        }
+        None => run_bridge(log_handle, args.config, args.project).await,
+    }
+}
 
-    let discovered_projects = Config::discover_projects(&args.config)?;
-    if args.project.is_none() && discovered_projects.len() > 1 {
+async fn run_bridge(
+    log_handle: reload::Handle<EnvFilter, Registry>,
+    config_path: PathBuf,
+    project: Option<String>,
+) -> Result<()> {
+    info!(config = %config_path.display(), "starting codex telegram bridge");
+    let discovered_projects = Config::discover_projects(&config_path)?;
+    if project.is_none() && discovered_projects.len() > 1 {
         info!(
             count = discovered_projects.len(),
             "starting supervisor mode for multi-project cc-connect config"
         );
-        return run_supervisor(args.config, discovered_projects).await;
+        return run_supervisor(config_path, discovered_projects).await;
     }
 
-    let config = Config::load(&args.config, args.project.as_deref())?;
+    let config = Config::load(&config_path, project.as_deref())?;
     reload_log_level(&log_handle, &config.log_level);
 
     if let Some(project_name) = &config.project_name {
@@ -65,7 +90,7 @@ async fn run(log_handle: reload::Handle<EnvFilter, Registry>) -> Result<()> {
         "configuration loaded"
     );
 
-    let state_path = config.default_state_path(&args.config);
+    let state_path = config.default_state_path(&config_path);
     let telegram = TelegramClient::new(config.telegram.token.clone())?;
     let codex = Arc::new(CodexClient::new(&config.codex));
     let state = Arc::new(StateStore::load(

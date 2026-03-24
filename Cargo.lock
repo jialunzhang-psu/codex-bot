@@ -207,6 +207,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "parking_lot",
  "reqwest",
  "rusqlite",

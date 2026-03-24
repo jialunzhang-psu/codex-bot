@@ -22,6 +22,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
+pub use crate::accounts::{
+    AddAccountResult, PoolAccountView, PoolList, RemoveAccountResult, RemoveAllAccountsResult,
+    StoredAccount, SwitchAccountResult,
+};
 use crate::config::CodexConfig;
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -63,6 +67,13 @@ pub struct UsageReport {
     pub credits: Option<UsageCredits>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EffectiveCodexSettings {
+    pub codex_home: PathBuf,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageBucket {
     pub name: String,
@@ -85,6 +96,24 @@ pub struct UsageCredits {
     pub has_credits: bool,
     pub unlimited: bool,
     pub balance: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountUsageView {
+    pub account: StoredAccount,
+    pub pooled: bool,
+    pub active: bool,
+    pub status: String,
+    pub message: Option<String>,
+    pub usage: Option<UsageReport>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolUsageReport {
+    pub pool_dir: PathBuf,
+    pub codex_auth_path: PathBuf,
+    pub active_in_pool: bool,
+    pub accounts: Vec<AccountUsageView>,
 }
 
 struct CodexStore {
@@ -164,6 +193,30 @@ struct RawUsageCredits {
     unlimited: bool,
     #[serde(default)]
     balance: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CodexHomeConfigFile {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default, rename = "model_reasoning_effort")]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    projects: HashMap<String, CodexProjectConfigFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CodexProjectConfigFile {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default, rename = "model_reasoning_effort")]
+    reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CodexConfigDefaults {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug)]
@@ -323,6 +376,17 @@ impl CodexClient {
         codex_home()
     }
 
+    pub fn effective_settings(&self, runtime: &RuntimeSettings) -> Result<EffectiveCodexSettings> {
+        let codex_home = self.codex_home()?;
+        let defaults = load_codex_defaults(&codex_home, &self.work_dir)?;
+        Ok(EffectiveCodexSettings {
+            codex_home,
+            model: normalize_optional(runtime.model.clone()).or(defaults.model),
+            reasoning_effort: normalize_reasoning(runtime.reasoning_effort.clone())
+                .or(defaults.reasoning_effort),
+        })
+    }
+
     pub fn spawn_turn(
         &self,
         thread_id: Option<&str>,
@@ -467,13 +531,112 @@ impl CodexClient {
         list_sessions_in(&self.work_dir, &self.codex_home()?)
     }
 
+    pub fn list_accounts(&self) -> Result<PoolList> {
+        crate::accounts::list_accounts(&self.codex_home()?)
+    }
+
+    pub fn add_current_account(&self, label: Option<String>) -> Result<AddAccountResult> {
+        crate::accounts::add_current_account(&self.codex_home()?, label)
+    }
+
+    pub fn switch_account(&self, account_id: &str) -> Result<SwitchAccountResult> {
+        crate::accounts::switch_account(&self.codex_home()?, account_id)
+    }
+
+    pub fn remove_account(&self, account_id: &str) -> Result<RemoveAccountResult> {
+        crate::accounts::remove_account(&self.codex_home()?, account_id)
+    }
+
+    pub fn remove_all_accounts(&self) -> Result<RemoveAllAccountsResult> {
+        crate::accounts::remove_all_accounts(&self.codex_home()?)
+    }
+
     pub fn get_session_history(&self, session_id: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
         get_session_history_in(session_id, limit, &self.codex_home()?)
     }
 
-    pub async fn get_usage(&self) -> Result<UsageReport> {
-        let tokens = read_oauth_tokens_in(&self.codex_home()?)?;
-        fetch_usage(&Client::new(), tokens).await
+    pub async fn get_all_usage(&self) -> Result<PoolUsageReport> {
+        let codex_home = self.codex_home()?;
+        let resolved = crate::accounts::resolve_accounts(&codex_home)?;
+        let client = Client::new();
+
+        if resolved.accounts.is_empty() {
+            let usage = fetch_usage(&client, read_oauth_tokens_in(&codex_home)?).await?;
+            return Ok(PoolUsageReport {
+                pool_dir: resolved.pool_dir,
+                codex_auth_path: resolved.codex_auth_path,
+                active_in_pool: false,
+                accounts: vec![AccountUsageView {
+                    account: inferred_current_account(&usage),
+                    pooled: false,
+                    active: true,
+                    status: "ok".to_string(),
+                    message: None,
+                    usage: Some(usage),
+                }],
+            });
+        }
+
+        let mut accounts = Vec::new();
+        for entry in resolved.accounts {
+            if !entry.auth_path.exists() {
+                accounts.push(AccountUsageView {
+                    account: entry.account,
+                    pooled: true,
+                    active: entry.active,
+                    status: "missing_auth".to_string(),
+                    message: Some(format!(
+                        "pooled auth file missing: {}",
+                        entry.auth_path.display()
+                    )),
+                    usage: None,
+                });
+                continue;
+            }
+
+            match read_oauth_tokens_from_path(&entry.auth_path) {
+                Ok(tokens) => match fetch_usage(&client, tokens).await {
+                    Ok(usage) => accounts.push(AccountUsageView {
+                        account: entry.account,
+                        pooled: true,
+                        active: entry.active,
+                        status: "ok".to_string(),
+                        message: None,
+                        usage: Some(usage),
+                    }),
+                    Err(err) => {
+                        let message = err.to_string();
+                        accounts.push(AccountUsageView {
+                            account: entry.account,
+                            pooled: true,
+                            active: entry.active,
+                            status: if looks_like_usage_limit_error(&message) {
+                                "quota_exhausted".to_string()
+                            } else {
+                                "usage_error".to_string()
+                            },
+                            message: Some(message),
+                            usage: None,
+                        });
+                    }
+                },
+                Err(err) => accounts.push(AccountUsageView {
+                    account: entry.account,
+                    pooled: true,
+                    active: entry.active,
+                    status: "invalid_auth".to_string(),
+                    message: Some(err.to_string()),
+                    usage: None,
+                }),
+            }
+        }
+
+        Ok(PoolUsageReport {
+            pool_dir: resolved.pool_dir,
+            codex_auth_path: resolved.codex_auth_path,
+            active_in_pool: resolved.active_in_pool,
+            accounts,
+        })
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
@@ -508,20 +671,22 @@ impl CodexClient {
         ))
     }
 
-    pub async fn logout(&self) -> Result<AuthStatus> {
-        let output = self.run_command_capture(&["logout"]).await?;
-        if !output.status.success() && summarize_auth_status(&output.output) != "Not logged in" {
-            return Err(anyhow!(
-                "failed to log out: {}",
-                if output.output.is_empty() {
-                    format!("codex logout exited with {}", output.status)
-                } else {
-                    output.output
-                }
-            ));
+    pub async fn run_device_login_interactive(&self) -> Result<()> {
+        let args = ["login", "--device-auth"];
+        let status = self
+            .command()
+            .args(args)
+            .current_dir(&self.work_dir)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .await
+            .with_context(|| format!("failed to run {} {}", self.bin, args.join(" ")))?;
+        if !status.success() {
+            bail!("codex login exited with status {status}");
         }
-
-        self.login_status().await
+        Ok(())
     }
 
     pub fn spawn_device_login(&self, cancel: CancellationToken) -> Result<SpawnedLogin> {
@@ -886,6 +1051,68 @@ fn normalize_reasoning(reasoning: Option<String>) -> Option<String> {
         "high" => Some("high".to_string()),
         "xhigh" | "x-high" | "very-high" => Some("xhigh".to_string()),
         _ => None,
+    }
+}
+
+impl CodexHomeConfigFile {
+    fn resolve_for_work_dir(&self, work_dir: &Path) -> CodexConfigDefaults {
+        let mut defaults = CodexConfigDefaults {
+            model: normalize_optional(self.model.clone()),
+            reasoning_effort: normalize_reasoning(self.reasoning_effort.clone()),
+        };
+
+        if let Some(project) = self.best_matching_project(work_dir) {
+            if let Some(model) = normalize_optional(project.model.clone()) {
+                defaults.model = Some(model);
+            }
+            if let Some(reasoning_effort) = normalize_reasoning(project.reasoning_effort.clone()) {
+                defaults.reasoning_effort = Some(reasoning_effort);
+            }
+        }
+
+        defaults
+    }
+
+    fn best_matching_project(&self, work_dir: &Path) -> Option<&CodexProjectConfigFile> {
+        let work_dir = canonicalize_or_clone(work_dir);
+        self.projects
+            .iter()
+            .filter_map(|(project_path, config)| {
+                let project_path = canonicalize_or_clone(Path::new(project_path));
+                path_prefix_len(&project_path, &work_dir).map(|len| (len, config))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, config)| config)
+    }
+}
+
+fn load_codex_defaults(codex_home: &Path, work_dir: &Path) -> Result<CodexConfigDefaults> {
+    let config_path = codex_home.join("config.toml");
+    if !config_path.exists() {
+        return Ok(CodexConfigDefaults::default());
+    }
+
+    let raw = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config: CodexHomeConfigFile = toml::from_str(&raw)
+        .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
+    Ok(config.resolve_for_work_dir(work_dir))
+}
+
+fn canonicalize_or_clone(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_prefix_len(prefix: &Path, path: &Path) -> Option<usize> {
+    let mut len = 0usize;
+    let mut prefix_components = prefix.components();
+    let mut path_components = path.components();
+    loop {
+        match (prefix_components.next(), path_components.next()) {
+            (None, _) => return Some(len),
+            (Some(left), Some(right)) if left == right => len += 1,
+            _ => return None,
+        }
     }
 }
 
@@ -1529,8 +1756,11 @@ fn find_latest_state_db(codex_home: &Path) -> Result<Option<PathBuf>> {
 
 fn read_oauth_tokens_in(codex_home: &Path) -> Result<OAuthTokens> {
     let store = CodexStore::from_home(codex_home.to_path_buf())?;
-    let raw = fs::read(&store.auth_path)
-        .with_context(|| format!("failed to read {}", store.auth_path.display()))?;
+    read_oauth_tokens_from_path(&store.auth_path)
+}
+
+fn read_oauth_tokens_from_path(path: &Path) -> Result<OAuthTokens> {
+    let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let payload: OAuthPayload =
         serde_json::from_slice(&raw).context("failed to parse Codex auth.json")?;
 
@@ -1548,6 +1778,34 @@ fn read_oauth_tokens_in(codex_home: &Path) -> Result<OAuthTokens> {
         access_token,
         account_id,
     })
+}
+
+fn inferred_current_account(usage: &UsageReport) -> StoredAccount {
+    let id = if !usage.account_id.trim().is_empty() {
+        usage.account_id.clone()
+    } else if !usage.email.trim().is_empty() {
+        usage.email.clone()
+    } else if !usage.user_id.trim().is_empty() {
+        usage.user_id.clone()
+    } else {
+        "current".to_string()
+    };
+
+    StoredAccount {
+        id,
+        label: Some("current".to_string()),
+        created_ms: 0,
+    }
+}
+
+fn looks_like_usage_limit_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("you've hit your usage limit")
+        || lowered.contains("usage limit")
+        || lowered.contains("insufficient_quota")
+        || lowered.contains("insufficient quota")
+        || lowered.contains("quota exceeded")
+        || lowered.contains("quota")
 }
 
 async fn fetch_usage(client: &Client, tokens: OAuthTokens) -> Result<UsageReport> {
@@ -1916,6 +2174,14 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn test_client(codex_home: &Path, work_dir: &Path) -> CodexClient {
+        CodexClient {
+            bin: "codex".to_string(),
+            work_dir: work_dir.to_path_buf(),
+            extra_env: vec![format!("CODEX_HOME={}", codex_home.display())],
+        }
+    }
+
     #[test]
     fn parser_ignores_missing_item() {
         let mut parser = EventParser::default();
@@ -2009,6 +2275,60 @@ mod tests {
             .ingest_line("ABCD-12345")
             .expect("expected device auth prompt");
         assert_eq!(prompt.expires_in_minutes, Some(15));
+    }
+
+    #[test]
+    fn effective_settings_reads_codex_home_defaults() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let codex_home = tmp.path().join("codex-home");
+        let work_dir = tmp.path().join("work");
+        fs::create_dir_all(&codex_home)?;
+        fs::create_dir_all(&work_dir)?;
+        fs::write(
+            codex_home.join("config.toml"),
+            "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"xhigh\"\n",
+        )?;
+
+        let resolved =
+            test_client(&codex_home, &work_dir).effective_settings(&RuntimeSettings::default())?;
+        assert_eq!(resolved.codex_home, codex_home);
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
+        Ok(())
+    }
+
+    #[test]
+    fn effective_settings_prefers_project_and_runtime_overrides() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let codex_home = tmp.path().join("codex-home");
+        let project_root = tmp.path().join("project");
+        let project_override = project_root.join("nested");
+        let work_dir = project_override.join("child");
+        fs::create_dir_all(&codex_home)?;
+        fs::create_dir_all(&work_dir)?;
+        fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "model = \"gpt-root\"\nmodel_reasoning_effort = \"medium\"\n[projects.\"{}\"]\nmodel = \"gpt-project\"\n[projects.\"{}\"]\nmodel = \"gpt-specific\"\nmodel_reasoning_effort = \"high\"\n",
+                project_root.display(),
+                project_override.display()
+            ),
+        )?;
+
+        let client = test_client(&codex_home, &work_dir);
+        let resolved = client.effective_settings(&RuntimeSettings::default())?;
+        assert_eq!(resolved.model.as_deref(), Some("gpt-specific"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+
+        let runtime = RuntimeSettings::new(
+            Some("gpt-runtime".to_string()),
+            Some("xhigh".to_string()),
+            None,
+        );
+        let overridden = client.effective_settings(&runtime)?;
+        assert_eq!(overridden.model.as_deref(), Some("gpt-runtime"));
+        assert_eq!(overridden.reasoning_effort.as_deref(), Some("xhigh"));
+        Ok(())
     }
 
     #[test]

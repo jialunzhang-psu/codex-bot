@@ -13,8 +13,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::codex::{
-    AuthStatus, CodexClient, DeviceAuthPrompt, LoginEvent, RuntimeSettings, SessionSummary,
-    SpawnedTurn, TurnEvent, TurnOutcome, UsageReport,
+    AddAccountResult, CodexClient, DeviceAuthPrompt, LoginEvent, PoolAccountView, PoolList,
+    PoolUsageReport, RuntimeSettings, SessionSummary, SpawnedTurn, StoredAccount, TurnEvent,
+    TurnOutcome, UsageReport,
 };
 use crate::config::Config;
 use crate::state::StateStore;
@@ -37,6 +38,7 @@ struct ActiveLogin {
     cancel: CancellationToken,
     started_at: Instant,
     pid: u32,
+    label: Option<String>,
     verification_uri: String,
     user_code: String,
     expires_in_minutes: Option<u64>,
@@ -187,8 +189,16 @@ impl BridgeApp {
             "switch" => self.cmd_switch(context, command.args).await?,
             "history" => self.cmd_history(context, command.args).await?,
             "usage" => self.cmd_usage(context).await?,
-            "login" => self.cmd_login(context, command.args).await?,
-            "logout" => self.cmd_logout(context).await?,
+            "login" | "add-account" | "add_account" => {
+                self.cmd_login(context, command.args).await?
+            }
+            "list-accounts" | "list_accounts" => self.cmd_list_accounts(context).await?,
+            "switch-account" | "switch_account" => {
+                self.cmd_switch_account(context, command.args).await?
+            }
+            "remove-account" | "remove_account" => {
+                self.cmd_remove_account(context, command.args).await?
+            }
             "quiet" => self.cmd_quiet(context, command.args).await?,
             "remove" | "delete" => self.cmd_remove(context, command.args).await?,
             "current" => self.cmd_current(context).await?,
@@ -580,7 +590,16 @@ impl BridgeApp {
     }
 
     async fn cmd_usage(&self, context: &MessageContext) -> Result<()> {
-        let report = match self.codex.get_usage().await {
+        if !self.auth_commands_allowed(context) {
+            self.reply_text(
+                context,
+                "For safety, account and usage commands only work in a private chat with the bot.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let report = match self.codex.get_all_usage().await {
             Ok(report) => report,
             Err(err) => {
                 self.reply_text(context, &format!("Failed to fetch usage: {err}"))
@@ -588,7 +607,7 @@ impl BridgeApp {
                 return Err(err);
             }
         };
-        self.reply_text(context, &format_usage_report(&report))
+        self.reply_text(context, &format_pool_usage_report(&report))
             .await?;
         Ok(())
     }
@@ -597,42 +616,33 @@ impl BridgeApp {
         if !self.auth_commands_allowed(context) {
             self.reply_text(
                 context,
-                "For safety, /login and /logout only work in a private chat with the bot.",
+                "For safety, account and usage commands only work in a private chat with the bot.",
             )
             .await?;
             return Ok(());
         }
 
-        match args.first().map(|arg| arg.to_ascii_lowercase()) {
-            None => self.cmd_login_start(context).await?,
-            Some(action) if action == "status" => self.cmd_login_status(context).await?,
-            Some(action) if action == "cancel" || action == "stop" => {
-                self.cmd_login_cancel(context).await?
-            }
-            _ => {
-                self.reply_text(context, "Usage: /login [status|cancel]")
-                    .await?;
-            }
+        let action = (args.len() == 1).then(|| args[0].to_ascii_lowercase());
+        match action.as_deref() {
+            Some("status") => self.cmd_login_status(context).await?,
+            Some("cancel") | Some("stop") => self.cmd_login_cancel(context).await?,
+            _ => self.cmd_login_start(context, join_args(args)).await?,
         }
 
         Ok(())
     }
 
-    async fn cmd_login_start(&self, context: &MessageContext) -> Result<()> {
+    async fn cmd_login_start(&self, context: &MessageContext, label: Option<String>) -> Result<()> {
         if let Some(active) = self.active_login() {
             self.reply_text(context, &format_active_login(&active))
                 .await?;
             return Ok(());
         }
 
-        let status = self.codex.login_status().await?;
-        if status.logged_in {
+        if self.has_active_runs() {
             self.reply_text(
                 context,
-                &format!(
-                    "Codex is already logged in.\n{}\nUse /logout first if you want to switch to another OpenAI account.",
-                    status.summary
-                ),
+                "Cannot add or switch accounts while a Codex request is running. Wait for current requests to finish first.",
             )
             .await?;
             return Ok(());
@@ -642,7 +652,7 @@ impl BridgeApp {
             .telegram
             .send_message(
                 context.chat_id,
-                "Starting OpenAI device login...",
+                "Starting OpenAI account flow...",
                 Some(context.message_id),
             )
             .await?;
@@ -660,10 +670,17 @@ impl BridgeApp {
             Some(LoginEvent::Prompt(prompt)) => prompt,
             None => match spawned.join.await {
                 Ok(Ok(outcome)) => {
-                    let message = if outcome.output.is_empty() {
-                        "Codex login exited before showing a device code.".to_string()
-                    } else {
-                        outcome.output
+                    let message = match self.codex.add_current_account(label.clone()) {
+                        Ok(result) => format_add_account_completion(&result),
+                        Err(err) if outcome.output.is_empty() => {
+                            format!("Account flow finished, but adding to the pool failed: {err}")
+                        }
+                        Err(err) => {
+                            format!(
+                                "{}\n\nAdding the account to the pool failed: {}",
+                                outcome.output, err
+                            )
+                        }
                     };
                     self.render_terminal_text(context, preview.message_id, &message)
                         .await?;
@@ -687,7 +704,12 @@ impl BridgeApp {
             },
         };
 
-        let login_id = self.register_login(cancel, spawned.pid.load(Ordering::Relaxed), &prompt);
+        let login_id = self.register_login(
+            cancel,
+            spawned.pid.load(Ordering::Relaxed),
+            &prompt,
+            label.clone(),
+        );
         edit_or_send_message(
             &self.telegram,
             context.chat_id,
@@ -703,18 +725,24 @@ impl BridgeApp {
         let message_id = preview.message_id;
         tokio::spawn(async move {
             let text = match spawned.join.await {
-                Ok(Ok(_)) => format_login_completion(codex.login_status().await.ok()),
+                Ok(Ok(_)) => match codex.add_current_account(label.clone()) {
+                    Ok(result) => format_add_account_completion(&result),
+                    Err(err) => format!(
+                        "OpenAI login finished, but adding the account to the pool failed: {}",
+                        truncate_text(&err.to_string(), 1800)
+                    ),
+                },
                 Ok(Err(err)) => {
                     if err.to_string().contains("login cancelled") {
-                        "OpenAI login cancelled.".to_string()
+                        "OpenAI account flow cancelled.".to_string()
                     } else {
                         format!(
-                            "OpenAI login failed: {}",
+                            "OpenAI account flow failed: {}",
                             truncate_text(&err.to_string(), 1800)
                         )
                     }
                 }
-                Err(err) => format!("OpenAI login task join failed: {err}"),
+                Err(err) => format!("OpenAI account task join failed: {err}"),
             };
             edit_or_send_message(&telegram, chat_id, message_id, &text).await;
             finish_login(&active_login, login_id);
@@ -732,9 +760,12 @@ impl BridgeApp {
 
         let status = self.codex.login_status().await?;
         let text = if status.logged_in {
-            format!("Codex auth status: {}", status.summary)
+            format!(
+                "No /add-account flow is running.\nCurrent Codex auth status: {}",
+                status.summary
+            )
         } else {
-            "Codex auth status: Not logged in.\nUse /login to start OpenAI device login."
+            "No /add-account flow is running.\nCurrent Codex auth status: Not logged in.\nUse /add-account [label] to start OpenAI device login."
                 .to_string()
         };
         self.reply_text(context, &text).await?;
@@ -744,42 +775,188 @@ impl BridgeApp {
     async fn cmd_login_cancel(&self, context: &MessageContext) -> Result<()> {
         if let Some(active) = self.active_login() {
             active.cancel.cancel();
-            self.reply_text(context, "Stopping the OpenAI login flow.")
+            self.reply_text(context, "Stopping the OpenAI account flow.")
                 .await?;
         } else {
-            self.reply_text(context, "No OpenAI login flow is running.")
+            self.reply_text(context, "No /add-account flow is running.")
                 .await?;
         }
         Ok(())
     }
 
-    async fn cmd_logout(&self, context: &MessageContext) -> Result<()> {
+    async fn cmd_list_accounts(&self, context: &MessageContext) -> Result<()> {
         if !self.auth_commands_allowed(context) {
             self.reply_text(
                 context,
-                "For safety, /login and /logout only work in a private chat with the bot.",
+                "For safety, account and usage commands only work in a private chat with the bot.",
             )
             .await?;
             return Ok(());
         }
 
+        let list = self.codex.list_accounts()?;
+        if list.accounts.is_empty() {
+            self.reply_text(
+                context,
+                &format!(
+                    "No pooled accounts found in {}.\nUse /add-account [label] to add one.",
+                    list.pool_dir.display()
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        self.reply_text(context, &format_account_list(&list))
+            .await?;
+        Ok(())
+    }
+
+    async fn cmd_switch_account(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
+        if !self.auth_commands_allowed(context) {
+            self.reply_text(
+                context,
+                "For safety, account and usage commands only work in a private chat with the bot.",
+            )
+            .await?;
+            return Ok(());
+        }
+        if args.is_empty() {
+            self.reply_text(context, "Usage: /switch-account <number|id|label>")
+                .await?;
+            return Ok(());
+        }
         if self.active_login().is_some() {
             self.reply_text(
                 context,
-                "An OpenAI login flow is already running. Use /login cancel before /logout.",
+                "An /add-account flow is already running. Use /add-account cancel before switching accounts.",
+            )
+            .await?;
+            return Ok(());
+        }
+        if self.has_active_runs() {
+            self.reply_text(
+                context,
+                "Cannot switch accounts while a Codex request is running. Wait for current requests to finish first.",
             )
             .await?;
             return Ok(());
         }
 
-        let status = self.codex.logout().await?;
-        let text = if status.logged_in {
-            format!("Codex auth status: {}", status.summary)
-        } else if status.summary == "Not logged in" {
-            "Codex auth status: Not logged in.".to_string()
-        } else {
-            format!("Logged out.\n{}", status.summary)
+        let list = self.codex.list_accounts()?;
+        let matched = match match_account(&list.accounts, &args.join(" ")) {
+            Ok(account) => account,
+            Err(err) => {
+                self.reply_text(context, &err.to_string()).await?;
+                return Ok(());
+            }
         };
+        let result = match self.codex.switch_account(&matched.id) {
+            Ok(result) => result,
+            Err(err) => {
+                self.reply_text(context, &format!("Failed to switch account: {err}"))
+                    .await?;
+                return Err(err);
+            }
+        };
+
+        let text = if result.switched {
+            format!(
+                "Switched active Codex account: {} -> {}.",
+                result
+                    .from
+                    .as_ref()
+                    .map(format_stored_account)
+                    .unwrap_or_else(|| "(none)".to_string()),
+                format_stored_account(&result.to),
+            )
+        } else {
+            format!(
+                "Account {} is already active.",
+                format_stored_account(&result.to)
+            )
+        };
+        self.reply_text(context, &text).await?;
+        Ok(())
+    }
+
+    async fn cmd_remove_account(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
+        if !self.auth_commands_allowed(context) {
+            self.reply_text(
+                context,
+                "For safety, account and usage commands only work in a private chat with the bot.",
+            )
+            .await?;
+            return Ok(());
+        }
+        if args.is_empty() {
+            self.reply_text(context, "Usage: /remove-account <number|id|label|all>")
+                .await?;
+            return Ok(());
+        }
+        if self.active_login().is_some() {
+            self.reply_text(
+                context,
+                "An /add-account flow is already running. Use /add-account cancel before removing accounts.",
+            )
+            .await?;
+            return Ok(());
+        }
+        if self.has_active_runs() {
+            self.reply_text(
+                context,
+                "Cannot remove accounts while a Codex request is running. Wait for current requests to finish first.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if args.len() == 1 && args[0].eq_ignore_ascii_case("all") {
+            let result = match self.codex.remove_all_accounts() {
+                Ok(result) => result,
+                Err(err) => {
+                    self.reply_text(context, &format!("Failed to remove accounts: {err}"))
+                        .await?;
+                    return Err(err);
+                }
+            };
+            self.reply_text(
+                context,
+                &format!(
+                    "Removed {} pooled account(s). Remaining: {}.",
+                    result.removed.len(),
+                    result.remaining_accounts
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let list = self.codex.list_accounts()?;
+        let matched = match match_account(&list.accounts, &args.join(" ")) {
+            Ok(account) => account,
+            Err(err) => {
+                self.reply_text(context, &err.to_string()).await?;
+                return Ok(());
+            }
+        };
+
+        let result = match self.codex.remove_account(&matched.id) {
+            Ok(result) => result,
+            Err(err) => {
+                self.reply_text(context, &format!("Failed to remove account: {err}"))
+                    .await?;
+                return Err(err);
+            }
+        };
+        let mut text = format!(
+            "Removed pooled account: {}. Remaining: {}.",
+            format_stored_account(&result.account),
+            result.remaining_accounts
+        );
+        if result.removed_was_active {
+            text.push_str(" The active account was updated.");
+        }
         self.reply_text(context, &text).await?;
         Ok(())
     }
@@ -848,6 +1025,7 @@ impl BridgeApp {
     async fn cmd_status(&self, context: &MessageContext) -> Result<()> {
         let session = self.state.session(&context.session_key);
         let runtime = self.state.runtime_settings();
+        let effective = self.codex.effective_settings(&runtime)?;
         let running = self.active_run(&context.session_key);
         let login = self.active_login();
         let current = session
@@ -874,14 +1052,9 @@ impl BridgeApp {
                 )
             })
             .unwrap_or_else(|| "idle".to_string());
-        let codex_home = self
-            .codex
-            .codex_home()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|_| "(default)".to_string());
 
         let text = format!(
-            "Bot: @{bot}\nUser: {user}\nUser ID: {user_id}\nChat: {chat}\nSession key: {session_key}\nWorkdir: {workdir}\nCodex home: {codex_home}\nMode: {mode}\nModel: {model}\nReasoning: {reasoning}\nQuiet: {quiet}\nActive thread: {current}\nPending name: {pending_name}\nRunning: {running}\nLogin flow: {login}",
+            "Bot: @{bot}\nUser: {user}\nUser ID: {user_id}\nChat: {chat}\nSession key: {session_key}\nWorkdir: {workdir}\nCodex home: {codex_home}\nMode: {mode}\nModel: {model}\nReasoning: {reasoning}\nQuiet: {quiet}\nActive thread: {current}\nPending name: {pending_name}\nRunning: {running}\nAccount flow: {login}",
             bot = self.bot.username,
             user = context.user_name,
             user_id = context.user_id,
@@ -891,12 +1064,10 @@ impl BridgeApp {
                 .unwrap_or_else(|| context.chat_id.to_string()),
             session_key = context.session_key,
             workdir = self.codex.work_dir().display(),
-            codex_home = codex_home,
+            codex_home = effective.codex_home.display(),
             mode = runtime.mode,
-            model = runtime.model.unwrap_or_else(|| "(default)".to_string()),
-            reasoning = runtime
-                .reasoning_effort
-                .unwrap_or_else(|| "(default)".to_string()),
+            model = format_effective_value(effective.model),
+            reasoning = format_effective_value(effective.reasoning_effort),
             quiet = if session.quiet { "on" } else { "off" },
             running = running_text,
             login = login_text,
@@ -934,26 +1105,29 @@ impl BridgeApp {
     }
 
     async fn cmd_model(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
-        let mut runtime = self.state.runtime_settings();
+        let current = self.state.runtime_settings();
         if args.is_empty() {
+            let effective = self.codex.effective_settings(&current)?;
             self.reply_text(
                 context,
-                &format!(
-                    "Current model: {}",
-                    runtime.model.unwrap_or_else(|| "(default)".to_string())
-                ),
+                &format!("Current model: {}", format_effective_value(effective.model)),
             )
             .await?;
             return Ok(());
         }
 
-        runtime.model = Some(args.join(" "));
+        let runtime = RuntimeSettings::new(
+            Some(args.join(" ")),
+            current.reasoning_effort,
+            Some(current.mode),
+        );
         self.state.set_runtime_settings(runtime.clone())?;
+        let effective = self.codex.effective_settings(&runtime)?;
         self.reply_text(
             context,
             &format!(
                 "Model set to {}. It will apply to new turns.",
-                runtime.model.unwrap_or_default()
+                format_effective_value(effective.model)
             ),
         )
         .await?;
@@ -963,13 +1137,12 @@ impl BridgeApp {
     async fn cmd_reasoning(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
         let current = self.state.runtime_settings();
         if args.is_empty() {
+            let effective = self.codex.effective_settings(&current)?;
             self.reply_text(
                 context,
                 &format!(
                     "Current reasoning effort: {}\nAvailable values: low, medium, high, xhigh",
-                    current
-                        .reasoning_effort
-                        .unwrap_or_else(|| "(default)".to_string())
+                    format_effective_value(effective.reasoning_effort)
                 ),
             )
             .await?;
@@ -978,14 +1151,21 @@ impl BridgeApp {
 
         let runtime =
             RuntimeSettings::new(current.model, Some(args[0].clone()), Some(current.mode));
+        if runtime.reasoning_effort.is_none() {
+            self.reply_text(
+                context,
+                "Invalid reasoning effort. Available values: low, medium, high, xhigh",
+            )
+            .await?;
+            return Ok(());
+        }
         self.state.set_runtime_settings(runtime.clone())?;
+        let effective = self.codex.effective_settings(&runtime)?;
         self.reply_text(
             context,
             &format!(
                 "Reasoning effort set to {}. It will apply to new turns.",
-                runtime
-                    .reasoning_effort
-                    .unwrap_or_else(|| "(default)".to_string())
+                format_effective_value(effective.reasoning_effort)
             ),
         )
         .await?;
@@ -1046,6 +1226,7 @@ impl BridgeApp {
         cancel: CancellationToken,
         pid: u32,
         prompt: &DeviceAuthPrompt,
+        label: Option<String>,
     ) -> u64 {
         let login_id = self.next_login_id.fetch_add(1, Ordering::Relaxed);
         *self.active_login.lock() = Some(ActiveLogin {
@@ -1053,6 +1234,7 @@ impl BridgeApp {
             cancel,
             started_at: Instant::now(),
             pid,
+            label,
             verification_uri: prompt.verification_uri.clone(),
             user_code: prompt.user_code.clone(),
             expires_in_minutes: prompt.expires_in_minutes,
@@ -1062,6 +1244,10 @@ impl BridgeApp {
 
     fn active_login(&self) -> Option<ActiveLogin> {
         self.active_login.lock().clone()
+    }
+
+    fn has_active_runs(&self) -> bool {
+        !self.active_runs.lock().is_empty()
     }
 
     fn auth_commands_allowed(&self, context: &MessageContext) -> bool {
@@ -1156,9 +1342,12 @@ fn help_text() -> String {
         "/list [page] - List Codex sessions in this workdir",
         "/switch <number|id|name> - Switch to a previous session",
         "/history [n] - Show recent messages for the current session",
-        "/usage - Show Codex quota usage",
-        "/login [status|cancel] - Start or inspect OpenAI login",
-        "/logout - Remove the current Codex login",
+        "/usage - Show pooled account quota usage",
+        "/add-account [label|status|cancel] - Add/login a pooled OpenAI account",
+        "/list-accounts - List pooled Codex accounts",
+        "/switch-account <number|id|label> - Switch the active Codex account",
+        "/remove-account <number|id|label|all> - Remove pooled accounts",
+        "/login - Alias for /add-account",
         "/quiet [on|off] - Toggle progress messages for this chat",
         "/remove <number|id|name> - Delete a session from local Codex storage",
         "/current - Show the current session",
@@ -1197,15 +1386,23 @@ fn menu_commands() -> Vec<BotCommand> {
         },
         BotCommand {
             command: "usage".to_string(),
-            description: "Show Codex quota usage".to_string(),
+            description: "Show pooled account usage".to_string(),
         },
         BotCommand {
-            command: "login".to_string(),
-            description: "OpenAI account login".to_string(),
+            command: "add_account".to_string(),
+            description: "Add/login pooled account".to_string(),
         },
         BotCommand {
-            command: "logout".to_string(),
-            description: "Log out of Codex".to_string(),
+            command: "list_accounts".to_string(),
+            description: "List pooled accounts".to_string(),
+        },
+        BotCommand {
+            command: "switch_account".to_string(),
+            description: "Switch active account".to_string(),
+        },
+        BotCommand {
+            command: "remove_account".to_string(),
+            description: "Remove pooled account".to_string(),
         },
         BotCommand {
             command: "quiet".to_string(),
@@ -1353,12 +1550,18 @@ fn finish_login(active_login: &Arc<Mutex<Option<ActiveLogin>>>, login_id: u64) {
 }
 
 fn format_active_login(active: &ActiveLogin) -> String {
+    let label = active
+        .label
+        .as_deref()
+        .map(|label| format!(" for label `{label}`"))
+        .unwrap_or_default();
     let expiry = active
         .expires_in_minutes
         .map(|minutes| format!("\nExpires in about {minutes} minutes."))
         .unwrap_or_default();
     format!(
-        "An OpenAI login flow is already running.\nURL: {url}\nCode: {code}{expiry}\nStarted: {started}s ago\nUse /login cancel to stop it.",
+        "An /add-account flow is already running{label}.\nURL: {url}\nCode: {code}{expiry}\nStarted: {started}s ago\nUse /add-account cancel to stop it.",
+        label = label,
         url = active.verification_uri,
         code = active.user_code,
         expiry = expiry,
@@ -1372,22 +1575,55 @@ fn format_login_prompt(prompt: &DeviceAuthPrompt) -> String {
         .map(|minutes| format!("\nThis code expires in about {minutes} minutes."))
         .unwrap_or_default();
     format!(
-        "OpenAI login started for this bot.\n\n1. Open: {url}\n2. Sign in with the OpenAI account you want Codex to use.\n3. Enter code: {code}{expiry}\n\nWhen the browser flow finishes, this message will update.\nUse /login cancel to abort.",
+        "OpenAI account flow started for this bot.\n\n1. Open: {url}\n2. Sign in with the OpenAI account you want to add.\n3. Enter code: {code}{expiry}\n\nWhen the browser flow finishes, this message will update.\nUse /add-account cancel to abort.",
         url = prompt.verification_uri,
         code = prompt.user_code,
         expiry = expiry,
     )
 }
 
-fn format_login_completion(status: Option<AuthStatus>) -> String {
-    match status {
-        Some(status) if status.logged_in => format!(
-            "OpenAI login complete.\n{}\nNew turns will use this account.",
-            status.summary
-        ),
-        Some(status) => format!("OpenAI login finished.\n{}", status.summary),
-        None => "OpenAI login complete. New turns will use the updated account.".to_string(),
+fn format_add_account_completion(result: &AddAccountResult) -> String {
+    let verb = if result.created_new {
+        "Added account to the pool"
+    } else {
+        "Account is already in the pool"
+    };
+    format!(
+        "{verb}: {account}\nTotal pooled accounts: {total}",
+        verb = verb,
+        account = format_stored_account(&result.account),
+        total = result.total_accounts
+    )
+}
+
+fn format_account_list(list: &PoolList) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("Codex account pool: {}", list.pool_dir.display()));
+    lines.push(format!(
+        "Active auth file: {}",
+        list.codex_auth_path.display()
+    ));
+    for (index, account) in list.accounts.iter().enumerate() {
+        let marker = if account.active { "*" } else { " " };
+        lines.push(format!(
+            "{marker} {}. {} added={}",
+            index + 1,
+            format_pool_account(account),
+            format_account_created_at(account.created_ms)
+        ));
     }
+    if !list.active_in_pool {
+        lines.push("Current active auth is not one of the pooled accounts.".to_string());
+    }
+    lines.push(
+        "Use /switch-account <number|id|label> to switch, or /remove-account <number|id|label|all> to delete."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn format_effective_value(value: Option<String>) -> String {
+    value.unwrap_or_else(|| "unknown".to_string())
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -1423,8 +1659,40 @@ fn join_args(args: Vec<String>) -> Option<String> {
     }
 }
 
-fn format_usage_report(report: &UsageReport) -> String {
+fn format_pool_usage_report(report: &PoolUsageReport) -> String {
     let mut lines = Vec::new();
+    lines.push(format!(
+        "Codex account usage: {}",
+        report.pool_dir.display()
+    ));
+    lines.push(format!(
+        "Active auth file: {}",
+        report.codex_auth_path.display()
+    ));
+    if !report.active_in_pool && report.accounts.iter().any(|account| account.pooled) {
+        lines.push("Current active auth is not one of the pooled accounts.".to_string());
+    }
+    for account in &report.accounts {
+        lines.push(String::new());
+        let marker = if account.active { "*" } else { " " };
+        let scope = if account.pooled { "pooled" } else { "current" };
+        lines.push(format!(
+            "{marker} {} ({scope}) added={}",
+            format_stored_account(&account.account),
+            format_account_created_at(account.account.created_ms)
+        ));
+        lines.push(format!("Status: {}", account.status));
+        if let Some(message) = &account.message {
+            lines.push(format!("Message: {}", truncate_text(message, 240)));
+        }
+        if let Some(usage) = &account.usage {
+            append_usage_lines(&mut lines, usage);
+        }
+    }
+    lines.join("\n")
+}
+
+fn append_usage_lines(lines: &mut Vec<String>, report: &UsageReport) {
     lines.push(format!("Account: {}", usage_account_display(report)));
     lines.push(format!(
         "Provider: {}",
@@ -1441,23 +1709,20 @@ fn format_usage_report(report: &UsageReport) -> String {
 
     if report.buckets.is_empty() {
         lines.push("No usage buckets were returned.".to_string());
-        return lines.join("\n");
+        return;
     }
 
     for bucket in &report.buckets {
-        lines.push(String::new());
         lines.push(format!(
             "{}: allowed={}, limit_reached={}",
             bucket.name,
             yes_no(bucket.allowed),
             yes_no(bucket.limit_reached)
         ));
-
         if bucket.windows.is_empty() {
             lines.push("No windows reported.".to_string());
             continue;
         }
-
         for window in &bucket.windows {
             let remaining = (100 - window.used_percent).max(0);
             lines.push(format!(
@@ -1468,8 +1733,104 @@ fn format_usage_report(report: &UsageReport) -> String {
             ));
         }
     }
+}
 
-    lines.join("\n")
+fn format_pool_account(account: &PoolAccountView) -> String {
+    let stored = StoredAccount {
+        id: account.id.clone(),
+        label: account.label.clone(),
+        created_ms: account.created_ms,
+    };
+    format_stored_account(&stored)
+}
+
+fn format_stored_account(account: &StoredAccount) -> String {
+    match account.label.as_deref() {
+        Some(label) => format!("{label} [{}]", account.id),
+        None => account.id.clone(),
+    }
+}
+
+fn format_account_created_at(created_ms: u128) -> String {
+    let millis = created_ms.min(u64::MAX as u128) as u64;
+    let time = SystemTime::UNIX_EPOCH + Duration::from_millis(millis);
+    format_time(time)
+}
+
+fn match_account<'a>(accounts: &'a [PoolAccountView], query: &str) -> Result<&'a PoolAccountView> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("No account matched."));
+    }
+
+    if let Ok(index) = trimmed.parse::<usize>() {
+        if (1..=accounts.len()).contains(&index) {
+            return Ok(&accounts[index - 1]);
+        }
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let exact: Vec<&PoolAccountView> = accounts
+        .iter()
+        .filter(|account| {
+            account.id.eq_ignore_ascii_case(trimmed)
+                || account
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.eq_ignore_ascii_case(trimmed))
+        })
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+    if exact.len() > 1 {
+        return Err(ambiguous_account_error(trimmed, &exact));
+    }
+
+    let prefix: Vec<&PoolAccountView> = accounts
+        .iter()
+        .filter(|account| {
+            account.id.to_ascii_lowercase().starts_with(&lower)
+                || account
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.to_ascii_lowercase().starts_with(&lower))
+        })
+        .collect();
+    if prefix.len() == 1 {
+        return Ok(prefix[0]);
+    }
+    if prefix.len() > 1 {
+        return Err(ambiguous_account_error(trimmed, &prefix));
+    }
+
+    let contains: Vec<&PoolAccountView> = accounts
+        .iter()
+        .filter(|account| {
+            account.id.to_ascii_lowercase().contains(&lower)
+                || account
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.to_ascii_lowercase().contains(&lower))
+        })
+        .collect();
+    if contains.len() == 1 {
+        return Ok(contains[0]);
+    }
+    if contains.len() > 1 {
+        return Err(ambiguous_account_error(trimmed, &contains));
+    }
+
+    Err(anyhow!("No account matched: {trimmed}"))
+}
+
+fn ambiguous_account_error(query: &str, matches: &[&PoolAccountView]) -> anyhow::Error {
+    let options = matches
+        .iter()
+        .map(|account| format_pool_account(account))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow!("Multiple accounts matched {query:?}: {options}")
 }
 
 fn usage_account_display(report: &UsageReport) -> String {
