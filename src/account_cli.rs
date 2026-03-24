@@ -53,7 +53,7 @@ pub async fn run(
     match command {
         AccountsCommand::List => list_accounts(&scope),
         AccountsCommand::Add { label } => {
-            add_current_account(require_target(&scope, "add")?, label)
+            login_and_add_account(require_target(&scope, "add")?, label).await
         }
         AccountsCommand::Login { label } => {
             login_and_add_account(require_target(&scope, "login")?, label).await
@@ -157,12 +157,6 @@ fn list_accounts_global(targets: &[AccountTarget]) -> Result<()> {
     }
 
     println!("{}", format_global_account_list(&list, targets));
-    Ok(())
-}
-
-fn add_current_account(target: &AccountTarget, label: Option<String>) -> Result<()> {
-    let result = target.codex.add_current_account(label)?;
-    println!("{}", format_add_account_completion(&result));
     Ok(())
 }
 

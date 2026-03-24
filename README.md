@@ -100,8 +100,8 @@ Non-command text is forwarded to Codex as the next prompt.
 - `/switch <number|id|name>`: switch to a listed session
 - `/history [n]`: show the last `n` messages from the current session
 - `/usage`: show Codex quota usage
-- `/login [status|cancel]`: start or inspect OpenAI account login via device auth
-- `/logout`: log out the current Codex/OpenAI account
+- `/add-account [label|status|cancel]`: start or inspect OpenAI account login via device auth
+- `/login [label|status|cancel]`: alias for `/add-account`
 - `/quiet [on|off]`: hide or show thinking/tool progress messages for the current chat
 - `/remove <number|id|name>`: delete a saved session after selecting it from `/list`
 - `/current`: show the current session
@@ -117,5 +117,5 @@ Non-command text is forwarded to Codex as the next prompt.
 - `/new` and `/switch` are generation-guarded so an older cancelled run cannot overwrite a newer session selection.
 - `/remove` performs a full local cleanup: transcript files, `session_index.jsonl`, `history.jsonl`, and matching thread rows in the latest `state_*.sqlite`.
 - `/usage` reads `auth.json` from the same Codex home the bridge uses and calls the Codex usage endpoint directly.
-- `/login` and `/logout` are restricted to private chats because device codes are sensitive.
+- `/add-account` and `/login` are restricted to private chats because device codes are sensitive.
 - Codex event parsing is intentionally tolerant of missing or drifting JSON fields to avoid the crash pattern seen in the original Go bridge.
