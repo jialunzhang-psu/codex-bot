@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    CodexClient, RuntimeSettings, normalize_optional, normalize_reasoning, patch_session_source_in,
+    CodexClient, RuntimeSettings, configure_command_process_group, normalize_optional,
+    normalize_reasoning, patch_session_source_in, spawn_process_killer,
 };
 
 #[derive(Debug)]
@@ -62,6 +63,7 @@ impl CodexClient {
             .current_dir(&self.work_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        configure_command_process_group(&mut command);
 
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -99,13 +101,7 @@ impl CodexClient {
                 });
 
                 let killer_task = {
-                    let child = Arc::clone(&child);
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        cancel.cancelled().await;
-                        let mut child = child.lock().await;
-                        let _ = child.start_kill();
-                    })
+                    spawn_process_killer(Arc::clone(&child), Arc::clone(&pid_ref), cancel.clone())
                 };
 
                 let mut parser = EventParser::default();

@@ -4,7 +4,7 @@ mod review;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -19,7 +19,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -559,6 +559,7 @@ impl CodexClient {
             .current_dir(&self.work_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        configure_command_process_group(&mut command);
 
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -589,13 +590,7 @@ impl CodexClient {
                 let stderr_task = tokio::spawn(stream_lines(stderr, line_tx));
 
                 let killer_task = {
-                    let child = Arc::clone(&child);
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        cancel.cancelled().await;
-                        let mut child = child.lock().await;
-                        let _ = child.start_kill();
-                    })
+                    spawn_process_killer(Arc::clone(&child), Arc::clone(&pid_ref), cancel.clone())
                 };
 
                 let mut parser = DeviceAuthParser::default();
@@ -669,6 +664,63 @@ impl CodexClient {
             output: merge_command_output(&output.stdout, &output.stderr),
         })
     }
+}
+
+fn configure_command_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+fn spawn_process_killer(
+    child: Arc<Mutex<Child>>,
+    pid: Arc<AtomicU32>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        cancel.cancelled().await;
+
+        let group_pid = pid.load(Ordering::Relaxed);
+        if group_pid != 0 {
+            let _ = kill_process_group(group_pid, libc::SIGTERM);
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            let group_pid = pid.load(Ordering::Relaxed);
+            if group_pid != 0 {
+                let _ = kill_process_group(group_pid, libc::SIGKILL);
+            }
+        }
+
+        let mut child = child.lock().await;
+        let _ = child.start_kill();
+    })
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    let result = unsafe { libc::kill(-(pid as i32), signal) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32, _signal: libc::c_int) -> io::Result<()> {
+    Ok(())
 }
 
 impl DeviceAuthParser {
@@ -1849,6 +1901,8 @@ struct ResponseContent {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tokio::process::Command;
+    use tokio::time::{Duration, sleep, timeout};
 
     fn test_client(codex_home: &Path, work_dir: &Path) -> CodexClient {
         CodexClient {
@@ -2212,6 +2266,54 @@ mod tests {
         assert_eq!(keep_threads, 1);
         assert_eq!(target_tools, 0);
         assert_eq!(keep_tools, 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_killer_terminates_process_group() -> Result<()> {
+        let mut command = Command::new("bash");
+        command
+            .arg("-lc")
+            .arg("sleep 30 & wait")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_command_process_group(&mut command);
+
+        let child = command.spawn().context("failed to spawn test shell")?;
+        let pid = Arc::new(AtomicU32::new(child.id().unwrap_or_default()));
+        let child = Arc::new(Mutex::new(child));
+        let cancel = CancellationToken::new();
+        let killer = spawn_process_killer(Arc::clone(&child), Arc::clone(&pid), cancel.clone());
+
+        sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+
+        {
+            let mut child = child.lock().await;
+            timeout(Duration::from_secs(5), child.wait())
+                .await
+                .context("timed out waiting for test shell to exit")?
+                .context("failed to wait for test shell")?;
+        }
+
+        killer.await.context("killer task join failed")?;
+
+        let status = Command::new("bash")
+            .arg("-lc")
+            .arg(format!(
+                "pgrep -g {} >/dev/null",
+                pid.load(Ordering::Relaxed)
+            ))
+            .status()
+            .await
+            .context("failed to query test process group")?;
+        assert!(
+            !status.success(),
+            "expected process group {} to be gone",
+            pid.load(Ordering::Relaxed)
+        );
+
         Ok(())
     }
 }
