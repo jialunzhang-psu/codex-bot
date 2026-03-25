@@ -194,6 +194,7 @@ fn build_review_args(settings: &RuntimeSettings, request: &ReviewRequest) -> Vec
     }
 
     args.push("review".to_string());
+    args.push("--skip-git-repo-check".to_string());
     match &request.target {
         ReviewTarget::Uncommitted => args.push("--uncommitted".to_string()),
         ReviewTarget::Base(branch) => {
@@ -225,6 +226,8 @@ fn join_instructions(args: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+
+    use crate::codex::RuntimeSettings;
 
     use super::{ReviewRequest, ReviewTarget};
 
@@ -261,5 +264,16 @@ mod tests {
         assert_eq!(request.target, ReviewTarget::Uncommitted);
         assert_eq!(request.instructions.as_deref(), Some("bugs only"));
         Ok(())
+    }
+
+    #[test]
+    fn build_review_args_skips_git_repo_check() {
+        let settings = RuntimeSettings::default();
+        let request = ReviewRequest {
+            target: ReviewTarget::Uncommitted,
+            instructions: None,
+        };
+        let args = super::build_review_args(&settings, &request);
+        assert!(args.iter().any(|arg| arg == "--skip-git-repo-check"));
     }
 }

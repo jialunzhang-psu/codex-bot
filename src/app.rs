@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -216,6 +217,7 @@ impl BridgeApp {
             "switch" => self.cmd_switch(context, command.args).await?,
             "history" => self.cmd_history(context, command.args).await?,
             "review" => self.cmd_review(context, command.args).await?,
+            "trust-dir" | "trust_dir" => self.cmd_trust_dir(context, command.args).await?,
             "usage" => self.cmd_usage(context).await?,
             "login" | "add-account" | "add_account" => {
                 self.cmd_login(context, command.args).await?
@@ -796,6 +798,34 @@ impl BridgeApp {
         };
         self.reply_text(context, &format_pool_usage_report(&report))
             .await?;
+        Ok(())
+    }
+
+    async fn cmd_trust_dir(&self, context: &MessageContext, args: Vec<String>) -> Result<()> {
+        let target = join_args(args).map(PathBuf::from);
+        let result = match self.codex.trust_dir(target.as_deref()) {
+            Ok(result) => result,
+            Err(err) => {
+                self.reply_text(context, &format!("Failed to trust directory: {err}"))
+                    .await?;
+                return Err(err);
+            }
+        };
+
+        let text = if result.already_trusted {
+            format!(
+                "Directory is already trusted.\nCodex config: {}\nTrusted dir: {}",
+                result.config_path.display(),
+                result.trusted_dir.display()
+            )
+        } else {
+            format!(
+                "Marked directory as trusted.\nCodex config: {}\nTrusted dir: {}",
+                result.config_path.display(),
+                result.trusted_dir.display()
+            )
+        };
+        self.reply_text(context, &text).await?;
         Ok(())
     }
 
@@ -1543,6 +1573,7 @@ fn help_text() -> String {
         "/review [notes] - Review uncommitted changes",
         "/review base <branch> [notes] - Review changes against a base branch",
         "/review commit <sha> [notes] - Review a commit",
+        "/trust-dir [path] - Mark the current workdir or a path as trusted in Codex config",
         "/usage - Show pooled account quota usage",
         "/add-account [label|status|cancel] - Add/login a pooled OpenAI account",
         "/list-accounts - List pooled Codex accounts",
@@ -1604,6 +1635,10 @@ fn menu_commands() -> Vec<BotCommand> {
         BotCommand {
             command: "review".to_string(),
             description: "Review code changes".to_string(),
+        },
+        BotCommand {
+            command: "trust_dir".to_string(),
+            description: "Mark a directory trusted".to_string(),
         },
         BotCommand {
             command: "usage".to_string(),

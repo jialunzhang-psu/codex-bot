@@ -23,6 +23,8 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use toml::Value as TomlValue;
+use toml::map::Map as TomlMap;
 use walkdir::WalkDir;
 
 pub use crate::accounts::{
@@ -77,6 +79,13 @@ pub struct EffectiveCodexSettings {
     pub codex_home: PathBuf,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustDirResult {
+    pub config_path: PathBuf,
+    pub trusted_dir: PathBuf,
+    pub already_trusted: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -361,6 +370,18 @@ impl CodexClient {
             model: normalize_optional(runtime.model.clone()).or(defaults.model),
             reasoning_effort: normalize_reasoning(runtime.reasoning_effort.clone())
                 .or(defaults.reasoning_effort),
+        })
+    }
+
+    pub fn trust_dir(&self, dir: Option<&Path>) -> Result<TrustDirResult> {
+        let codex_home = self.codex_home()?;
+        let config_path = codex_home.join("config.toml");
+        let trusted_dir = resolve_trust_dir(&self.work_dir, dir);
+        let already_trusted = upsert_trusted_project(&config_path, &trusted_dir)?;
+        Ok(TrustDirResult {
+            config_path,
+            trusted_dir,
+            already_trusted,
         })
     }
 
@@ -790,6 +811,68 @@ fn load_codex_defaults(codex_home: &Path, work_dir: &Path) -> Result<CodexConfig
     let config: CodexHomeConfigFile = toml::from_str(&raw)
         .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
     Ok(config.resolve_for_work_dir(work_dir))
+}
+
+fn resolve_trust_dir(work_dir: &Path, dir: Option<&Path>) -> PathBuf {
+    let target = match dir {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => work_dir.join(path),
+        None => work_dir.to_path_buf(),
+    };
+    canonicalize_or_clone(&target)
+}
+
+fn upsert_trusted_project(config_path: &Path, trusted_dir: &Path) -> Result<bool> {
+    let mut config = if config_path.exists() {
+        let raw = fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        if raw.trim().is_empty() {
+            TomlValue::Table(TomlMap::new())
+        } else {
+            toml::from_str::<TomlValue>(&raw)
+                .with_context(|| format!("invalid TOML in {}", config_path.display()))?
+        }
+    } else {
+        TomlValue::Table(TomlMap::new())
+    };
+
+    let root = config
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("top-level Codex config must be a TOML table"))?;
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| TomlValue::Table(TomlMap::new()));
+    let projects = projects
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("Codex config key `projects` must be a TOML table"))?;
+    let project_key = trusted_dir.display().to_string();
+    let project = projects
+        .entry(project_key)
+        .or_insert_with(|| TomlValue::Table(TomlMap::new()));
+    let project = project
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("Codex project entry must be a TOML table"))?;
+
+    let already_trusted = project
+        .get("trust_level")
+        .and_then(TomlValue::as_str)
+        .is_some_and(|value| value == "trusted");
+    project.insert(
+        "trust_level".to_string(),
+        TomlValue::String("trusted".to_string()),
+    );
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = toml::to_string_pretty(&config).context("failed to encode Codex config TOML")?;
+    let tmp_path = config_path.with_extension("tmp");
+    fs::write(&tmp_path, raw).with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, config_path)
+        .with_context(|| format!("failed to replace {}", config_path.display()))?;
+
+    Ok(already_trusted)
 }
 
 fn canonicalize_or_clone(path: &Path) -> PathBuf {
@@ -1866,6 +1949,56 @@ mod tests {
         let overridden = client.effective_settings(&runtime)?;
         assert_eq!(overridden.model.as_deref(), Some("gpt-runtime"));
         assert_eq!(overridden.reasoning_effort.as_deref(), Some("xhigh"));
+        Ok(())
+    }
+
+    #[test]
+    fn trust_dir_uses_work_dir_by_default() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let codex_home = tmp.path().join("codex-home");
+        let work_dir = tmp.path().join("work");
+        fs::create_dir_all(&work_dir)?;
+
+        let result = test_client(&codex_home, &work_dir).trust_dir(None)?;
+        assert_eq!(result.config_path, codex_home.join("config.toml"));
+        assert_eq!(result.trusted_dir, canonicalize_or_clone(&work_dir));
+        assert!(!result.already_trusted);
+
+        let raw = fs::read_to_string(codex_home.join("config.toml"))?;
+        let config: TomlValue = toml::from_str(&raw)?;
+        assert_eq!(
+            config
+                .get("projects")
+                .and_then(TomlValue::as_table)
+                .and_then(|projects| projects.get(&result.trusted_dir.display().to_string()))
+                .and_then(TomlValue::as_table)
+                .and_then(|project| project.get("trust_level"))
+                .and_then(TomlValue::as_str),
+            Some("trusted")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trust_dir_updates_existing_project() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let codex_home = tmp.path().join("codex-home");
+        let work_dir = tmp.path().join("work");
+        fs::create_dir_all(&codex_home)?;
+        fs::create_dir_all(&work_dir)?;
+        fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "model = \"gpt-5.4\"\n[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+                canonicalize_or_clone(&work_dir).display()
+            ),
+        )?;
+
+        let result = test_client(&codex_home, &work_dir).trust_dir(None)?;
+        assert!(!result.already_trusted);
+
+        let second = test_client(&codex_home, &work_dir).trust_dir(None)?;
+        assert!(second.already_trusted);
         Ok(())
     }
 

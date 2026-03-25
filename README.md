@@ -99,6 +99,7 @@ Non-command text is forwarded to Codex as the next prompt.
 - `/list [page]`: list saved Codex sessions for the configured work directory
 - `/switch <number|id|name>`: switch to a listed session
 - `/history [n]`: show the last `n` messages from the current session
+- `/trust-dir [path]`: mark the current workdir, or a specific path, as trusted in Codex config
 - `/usage`: show Codex quota usage
 - `/add-account [label|status|cancel]`: start or inspect OpenAI account login via device auth
 - `/login [label|status|cancel]`: alias for `/add-account`
