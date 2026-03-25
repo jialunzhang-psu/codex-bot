@@ -182,7 +182,11 @@ impl CodexClient {
 }
 
 fn build_review_args(settings: &RuntimeSettings, request: &ReviewRequest) -> Vec<String> {
-    let mut args = Vec::new();
+    let mut args = vec![
+        "exec".to_string(),
+        "review".to_string(),
+        "--skip-git-repo-check".to_string(),
+    ];
 
     if let Some(model) = normalize_optional(settings.model.clone()) {
         args.push("--model".to_string());
@@ -193,8 +197,6 @@ fn build_review_args(settings: &RuntimeSettings, request: &ReviewRequest) -> Vec
         args.push(format!("model_reasoning_effort={effort:?}"));
     }
 
-    args.push("review".to_string());
-    args.push("--skip-git-repo-check".to_string());
     match &request.target {
         ReviewTarget::Uncommitted => args.push("--uncommitted".to_string()),
         ReviewTarget::Base(branch) => {
@@ -267,13 +269,18 @@ mod tests {
     }
 
     #[test]
-    fn build_review_args_skips_git_repo_check() {
+    fn build_review_args_does_not_inject_trust_override() {
         let settings = RuntimeSettings::default();
         let request = ReviewRequest {
             target: ReviewTarget::Uncommitted,
             instructions: None,
         };
         let args = super::build_review_args(&settings, &request);
-        assert!(args.iter().any(|arg| arg == "--skip-git-repo-check"));
+        assert!(args.starts_with(&[
+            "exec".to_string(),
+            "review".to_string(),
+            "--skip-git-repo-check".to_string(),
+        ]));
+        assert!(!args.iter().any(|arg| arg.contains("trust_level")));
     }
 }
