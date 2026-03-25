@@ -181,18 +181,50 @@ async fn login_and_add_accounts(target: &AccountTarget, labels: Vec<String>) -> 
 
     let total = labels.len();
     for (index, label) in labels.into_iter().enumerate() {
-        println!(
-            "[{}/{}] Starting device login for label `{}`",
-            index + 1,
-            total,
-            label
-        );
-        login_and_add_account(target, Some(label)).await?;
+        login_and_add_account_with_retries(target, label.clone(), index + 1, total).await?;
         if index + 1 < total {
             println!();
         }
     }
     Ok(())
+}
+
+async fn login_and_add_account_with_retries(
+    target: &AccountTarget,
+    label: String,
+    index: usize,
+    total: usize,
+) -> Result<()> {
+    const RETRY_DELAYS_SECONDS: [u64; 3] = [30, 60, 120];
+
+    let mut attempt = 0usize;
+    loop {
+        println!(
+            "[{}/{}] Starting device login for label `{}`",
+            index, total, label
+        );
+        match login_and_add_account(target, Some(label.clone())).await {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if is_device_code_rate_limited(&err) && attempt < RETRY_DELAYS_SECONDS.len() =>
+            {
+                let delay = RETRY_DELAYS_SECONDS[attempt];
+                eprintln!(
+                    "Device login rate-limited for label `{}`. Waiting {}s before retrying...",
+                    label, delay
+                );
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn is_device_code_rate_limited(err: &anyhow::Error) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("device code request failed")
+        && (text.contains("429") || text.contains("too many requests"))
 }
 
 fn switch_account(target: &AccountTarget, query: &str) -> Result<()> {
@@ -583,9 +615,10 @@ mod tests {
     use std::fs;
 
     use anyhow::Result;
+    use anyhow::anyhow;
     use tempfile::TempDir;
 
-    use super::{AccountScope, resolve_account_scope};
+    use super::{AccountScope, is_device_code_rate_limited, resolve_account_scope};
 
     #[test]
     fn resolve_account_scope_collapses_shared_codex_home() -> Result<()> {
@@ -665,5 +698,16 @@ token = "2"
             AccountScope::Ambiguous(_)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn device_code_rate_limit_detection_is_specific() {
+        let limited = anyhow!(
+            "Error logging in with device code: device code request failed with status 429 Too Many Requests"
+        );
+        assert!(is_device_code_rate_limited(&limited));
+
+        let other = anyhow!("codex login exited with status exit status: 1");
+        assert!(!is_device_code_rate_limited(&other));
     }
 }
