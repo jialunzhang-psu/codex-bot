@@ -534,21 +534,12 @@ impl CodexClient {
     }
 
     pub async fn run_device_login_interactive(&self) -> Result<()> {
-        let args = ["login", "--device-auth"];
-        let status = self
-            .command()
-            .args(args)
-            .current_dir(&self.work_dir)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
+        self.run_login_interactive_with_args(&["login", "--device-auth"])
             .await
-            .with_context(|| format!("failed to run {} {}", self.bin, args.join(" ")))?;
-        if !status.success() {
-            bail!("codex login exited with status {status}");
-        }
-        Ok(())
+    }
+
+    pub async fn run_browser_login_interactive(&self) -> Result<()> {
+        self.run_login_interactive_with_args(&["login"]).await
     }
 
     pub fn spawn_device_login(&self, cancel: CancellationToken) -> Result<SpawnedLogin> {
@@ -640,6 +631,23 @@ impl CodexClient {
             join,
             pid,
         })
+    }
+
+    async fn run_login_interactive_with_args(&self, args: &[&str]) -> Result<()> {
+        let status = self
+            .command()
+            .args(args)
+            .current_dir(&self.work_dir)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .await
+            .with_context(|| format!("failed to run {} {}", self.bin, args.join(" ")))?;
+        if !status.success() {
+            bail!("codex login exited with status {status}");
+        }
+        Ok(())
     }
 
     fn command(&self) -> Command {

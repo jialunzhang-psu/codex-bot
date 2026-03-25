@@ -174,6 +174,16 @@ async fn login_and_add_account(target: &AccountTarget, label: Option<String>) ->
     Ok(())
 }
 
+async fn login_and_add_account_via_browser(
+    target: &AccountTarget,
+    label: Option<String>,
+) -> Result<()> {
+    target.codex.run_browser_login_interactive().await?;
+    let result = target.codex.add_current_account(label)?;
+    println!("{}", format_add_account_completion(&result));
+    Ok(())
+}
+
 async fn login_and_add_accounts(target: &AccountTarget, labels: Vec<String>) -> Result<()> {
     if labels.is_empty() {
         bail!("usage: accounts add-accounts <label>...");
@@ -205,16 +215,24 @@ async fn login_and_add_account_with_retries(
         );
         match login_and_add_account(target, Some(label.clone())).await {
             Ok(()) => return Ok(()),
-            Err(err)
-                if is_device_code_rate_limited(&err) && attempt < RETRY_DELAYS_SECONDS.len() =>
-            {
-                let delay = RETRY_DELAYS_SECONDS[attempt];
+            Err(err) if is_device_code_rate_limited(&err) => {
                 eprintln!(
-                    "Device login rate-limited for label `{}`. Waiting {}s before retrying...",
-                    label, delay
+                    "Device login rate-limited for label `{}`. Falling back to browser login...",
+                    label
                 );
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                attempt += 1;
+                match login_and_add_account_via_browser(target, Some(label.clone())).await {
+                    Ok(()) => return Ok(()),
+                    Err(browser_err) if attempt < RETRY_DELAYS_SECONDS.len() => {
+                        let delay = RETRY_DELAYS_SECONDS[attempt];
+                        eprintln!(
+                            "Browser login for label `{}` failed: {}. Waiting {}s before retrying device login...",
+                            label, browser_err, delay
+                        );
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        attempt += 1;
+                    }
+                    Err(browser_err) => return Err(browser_err),
+                }
             }
             Err(err) => return Err(err),
         }
