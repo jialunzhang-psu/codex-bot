@@ -18,6 +18,10 @@ pub enum AccountsCommand {
     Add {
         label: Option<String>,
     },
+    #[command(alias = "add_accounts")]
+    AddAccounts {
+        labels: Vec<String>,
+    },
     Login {
         label: Option<String>,
     },
@@ -54,6 +58,9 @@ pub async fn run(
         AccountsCommand::List => list_accounts(&scope),
         AccountsCommand::Add { label } => {
             login_and_add_account(require_target(&scope, "add")?, label).await
+        }
+        AccountsCommand::AddAccounts { labels } => {
+            login_and_add_accounts(require_target(&scope, "add-accounts")?, labels).await
         }
         AccountsCommand::Login { label } => {
             login_and_add_account(require_target(&scope, "login")?, label).await
@@ -164,6 +171,27 @@ async fn login_and_add_account(target: &AccountTarget, label: Option<String>) ->
     target.codex.run_device_login_interactive().await?;
     let result = target.codex.add_current_account(label)?;
     println!("{}", format_add_account_completion(&result));
+    Ok(())
+}
+
+async fn login_and_add_accounts(target: &AccountTarget, labels: Vec<String>) -> Result<()> {
+    if labels.is_empty() {
+        bail!("usage: accounts add-accounts <label>...");
+    }
+
+    let total = labels.len();
+    for (index, label) in labels.into_iter().enumerate() {
+        println!(
+            "[{}/{}] Starting device login for label `{}`",
+            index + 1,
+            total,
+            label
+        );
+        login_and_add_account(target, Some(label)).await?;
+        if index + 1 < total {
+            println!();
+        }
+    }
     Ok(())
 }
 
