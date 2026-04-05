@@ -5,10 +5,9 @@ use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Local};
 use clap::Subcommand;
 
-use crate::accounts::PoolCatalog;
 use crate::codex::{
-    AddAccountResult, CodexClient, PoolAccountView, PoolList, PoolUsageReport, StoredAccount,
-    UsageCredits, UsageReport,
+    AccountUsageView, AddAccountResult, CodexClient, PoolAccountView, PoolUsageReport,
+    StoredAccount, UsageCredits, UsageReport,
 };
 use crate::config::Config;
 
@@ -55,7 +54,7 @@ pub async fn run(
     let scope = resolve_account_scope(config_path, selected_project)?;
 
     match command {
-        AccountsCommand::List => list_accounts(&scope),
+        AccountsCommand::List => list_accounts(&scope).await,
         AccountsCommand::Add { label } => {
             login_and_add_account(require_target(&scope, "add")?, label).await
         }
@@ -131,14 +130,14 @@ fn require_target<'a>(scope: &'a AccountScope, command: &str) -> Result<&'a Acco
     }
 }
 
-fn list_accounts(scope: &AccountScope) -> Result<()> {
+async fn list_accounts(scope: &AccountScope) -> Result<()> {
     match scope {
-        AccountScope::Resolved(target) => list_accounts_for_target(target),
-        AccountScope::Ambiguous(targets) => list_accounts_global(targets),
+        AccountScope::Resolved(target) => list_accounts_for_target(target).await,
+        AccountScope::Ambiguous(targets) => list_accounts_global(targets).await,
     }
 }
 
-fn list_accounts_for_target(target: &AccountTarget) -> Result<()> {
+async fn list_accounts_for_target(target: &AccountTarget) -> Result<()> {
     let list = target.codex.list_accounts()?;
     if list.accounts.is_empty() {
         println!(
@@ -148,11 +147,12 @@ fn list_accounts_for_target(target: &AccountTarget) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}", format_account_list(&list));
+    let report = target.codex.get_all_usage().await?;
+    println!("{}", format_account_usage_summary(&report));
     Ok(())
 }
 
-fn list_accounts_global(targets: &[AccountTarget]) -> Result<()> {
+async fn list_accounts_global(targets: &[AccountTarget]) -> Result<()> {
     let list = crate::accounts::list_pool_accounts()?;
     if list.accounts.is_empty() {
         println!(
@@ -163,7 +163,11 @@ fn list_accounts_global(targets: &[AccountTarget]) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}", format_global_account_list(&list, targets));
+    let target = targets
+        .first()
+        .ok_or_else(|| anyhow!("no codex projects found"))?;
+    let report = target.codex.get_all_usage().await?;
+    println!("{}", format_account_usage_summary(&report));
     Ok(())
 }
 
@@ -314,53 +318,48 @@ fn format_add_account_completion(result: &AddAccountResult) -> String {
     )
 }
 
-fn format_account_list(list: &PoolList) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!("Codex account pool: {}", list.pool_dir.display()));
-    lines.push(format!(
-        "Active auth file: {}",
-        list.codex_auth_path.display()
-    ));
-    for (index, account) in list.accounts.iter().enumerate() {
-        let marker = if account.active { "*" } else { " " };
-        lines.push(format!(
-            "{marker} {}. {} added={}",
-            index + 1,
-            format_pool_account(account),
-            format_account_created_at(account.created_ms)
-        ));
-    }
-    if !list.active_in_pool {
-        lines.push("Current active auth is not one of the pooled accounts.".to_string());
-    }
-    lines.push(
-        "Use `accounts switch <number|id|label>` to switch, or `accounts remove <number|id|label|--all>` to delete."
-            .to_string(),
-    );
-    lines.join("\n")
+fn format_account_usage_summary(report: &PoolUsageReport) -> String {
+    report
+        .accounts
+        .iter()
+        .filter(|account| account.pooled)
+        .map(format_account_usage_summary_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn format_global_account_list(list: &PoolCatalog, targets: &[AccountTarget]) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!("Codex account pool: {}", list.pool_dir.display()));
-    lines.push("Active auth file: multiple CODEX_HOME values detected".to_string());
-    for (index, account) in list.accounts.iter().enumerate() {
-        lines.push(format!(
-            "  {}. {} added={}",
-            index + 1,
-            format_stored_account(account),
-            format_account_created_at(account.created_ms)
-        ));
+fn format_account_usage_summary_line(account: &AccountUsageView) -> String {
+    format!(
+        "{}\t5h={}\t7d={}",
+        account_summary_name(&account.account),
+        usage_window_remaining(account.usage.as_ref(), 18_000),
+        usage_window_remaining(account.usage.as_ref(), 604_800)
+    )
+}
+
+fn account_summary_name(account: &StoredAccount) -> &str {
+    match account.label.as_deref() {
+        Some(label) if !label.trim().is_empty() => label,
+        _ => account.id.as_str(),
     }
-    lines.push(
-        "Pass `--project <name>` to inspect or modify the active account for one project."
-            .to_string(),
-    );
-    lines.push("Project CODEX_HOME values:".to_string());
-    for line in format_target_homes(targets).lines() {
-        lines.push(line.to_string());
-    }
-    lines.join("\n")
+}
+
+fn usage_window_remaining(report: Option<&UsageReport>, window_seconds: i64) -> String {
+    let Some(report) = report else {
+        return "-".to_string();
+    };
+
+    report
+        .buckets
+        .iter()
+        .find_map(|bucket| {
+            bucket
+                .windows
+                .iter()
+                .find(|window| window.window_seconds == window_seconds)
+                .map(|window| format!("{}%", (100 - window.used_percent).max(0)))
+        })
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_target_homes(targets: &[AccountTarget]) -> String {
@@ -631,12 +630,19 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use anyhow::Result;
     use anyhow::anyhow;
     use tempfile::TempDir;
 
-    use super::{AccountScope, is_device_code_rate_limited, resolve_account_scope};
+    use super::{
+        AccountScope, format_account_usage_summary, is_device_code_rate_limited,
+        resolve_account_scope,
+    };
+    use crate::codex::{
+        AccountUsageView, PoolUsageReport, StoredAccount, UsageBucket, UsageReport, UsageWindow,
+    };
 
     #[test]
     fn resolve_account_scope_collapses_shared_codex_home() -> Result<()> {
@@ -727,5 +733,85 @@ token = "2"
 
         let other = anyhow!("codex login exited with status exit status: 1");
         assert!(!is_device_code_rate_limited(&other));
+    }
+
+    #[test]
+    fn format_account_usage_summary_outputs_name_and_remaining_windows() {
+        let report = PoolUsageReport {
+            pool_dir: PathBuf::from("/tmp/pool"),
+            codex_auth_path: PathBuf::from("/tmp/auth.json"),
+            active_in_pool: true,
+            accounts: vec![
+                AccountUsageView {
+                    account: StoredAccount {
+                        id: "acct-alpha".to_string(),
+                        label: Some("alpha".to_string()),
+                        created_ms: 0,
+                    },
+                    pooled: true,
+                    active: true,
+                    status: "ok".to_string(),
+                    message: None,
+                    usage: Some(UsageReport {
+                        provider: "codex".to_string(),
+                        account_id: "acct-alpha".to_string(),
+                        user_id: String::new(),
+                        email: String::new(),
+                        plan: String::new(),
+                        buckets: vec![UsageBucket {
+                            name: "Rate limit".to_string(),
+                            allowed: true,
+                            limit_reached: false,
+                            windows: vec![
+                                UsageWindow {
+                                    name: "Primary".to_string(),
+                                    used_percent: 25,
+                                    window_seconds: 18_000,
+                                    reset_after_seconds: 0,
+                                    reset_at_unix: 0,
+                                },
+                                UsageWindow {
+                                    name: "Secondary".to_string(),
+                                    used_percent: 60,
+                                    window_seconds: 604_800,
+                                    reset_after_seconds: 0,
+                                    reset_at_unix: 0,
+                                },
+                            ],
+                        }],
+                        credits: None,
+                    }),
+                },
+                AccountUsageView {
+                    account: StoredAccount {
+                        id: "acct-beta".to_string(),
+                        label: None,
+                        created_ms: 0,
+                    },
+                    pooled: true,
+                    active: false,
+                    status: "usage_error".to_string(),
+                    message: Some("request failed".to_string()),
+                    usage: None,
+                },
+                AccountUsageView {
+                    account: StoredAccount {
+                        id: "acct-current".to_string(),
+                        label: Some("current".to_string()),
+                        created_ms: 0,
+                    },
+                    pooled: false,
+                    active: false,
+                    status: "ok".to_string(),
+                    message: None,
+                    usage: Some(UsageReport::default()),
+                },
+            ],
+        };
+
+        assert_eq!(
+            format_account_usage_summary(&report),
+            "alpha\t5h=75%\t7d=40%\nacct-beta\t5h=-\t7d=-"
+        );
     }
 }
