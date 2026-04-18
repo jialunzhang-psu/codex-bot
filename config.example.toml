@@ -1,8 +1,12 @@
 log_level = "info"
 state_path = "./codex-bot-state.json"
 
+[rpc]
+socket_dir = "./codex-bot-sockets"
+
 [telegram]
-token = "123456:replace-me"
+manager_token = "123456:replace-manager-token"
+worker_tokens = ["123456:replace-worker-token-0"]
 allow_from = [123456789]
 group_reply_all = false
 share_session_in_channel = false
@@ -14,4 +18,10 @@ bin = "codex"
 model = "gpt-5.4"
 reasoning_effort = "high"
 mode = "suggest"
+extra_env = []
+
+[claude]
+work_dir = "/absolute/path/to/your/project"
+bin = "claude"
+model = "claude-sonnet-4-6"
 extra_env = []

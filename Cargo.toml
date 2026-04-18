@@ -1,24 +1,14 @@
-[package]
-name = "codex-bot"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-anyhow = "1.0"
-chrono = { version = "0.4", features = ["clock", "serde"] }
-clap = { version = "4.5", features = ["derive", "env"] }
-libc = "0.2"
-parking_lot = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.45", features = ["full"] }
-tokio-util = "0.7"
-toml = "0.8"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-walkdir = "2.5"
-
-[dev-dependencies]
-tempfile = "3.15"
+[workspace]
+members = [
+    "crates/cli",
+    "crates/rpc",
+    "crates/daemon",
+    "crates/worker",
+    "crates/frontend-common",
+    "crates/telegram-frontend",
+    "crates/testing-frontend",
+    "crates/test-orch",
+    "crates/pty",
+    "crates/session",
+]
+resolver = "2"

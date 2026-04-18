@@ -94,29 +94,26 @@ Non-command text is forwarded to Codex as the next prompt.
 
 ## Telegram Commands
 
+Manager frontend:
+
 - `/help`: show help
-- `/new [name]`: start a fresh session
-- `/list [page]`: list saved Codex sessions for the configured work directory
-- `/switch <number|id|name>`: switch to a listed session
-- `/history [n]`: show the last `n` messages from the current session
-- `/trust-dir [path]`: mark the current workdir, or a specific path, as trusted in Codex config
-- `/usage`: show Codex quota usage
-- `/add-account [label|status|cancel]`: start or inspect OpenAI account login via device auth
-- `/login [label|status|cancel]`: alias for `/add-account`
-- `/quiet [on|off]`: hide or show thinking/tool progress messages for the current chat
-- `/remove <number|id|name>`: delete a saved session after selecting it from `/list`
-- `/current`: show the current session
-- `/status`: show bot/runtime status
-- `/mode [suggest|full-auto|yolo]`: show or set Codex mode
-- `/model [name]`: show or set the Codex model
-- `/reasoning [low|medium|high|xhigh]`: show or set reasoning effort
+- `/workers`: list live workers
+- `/bots`: list available worker bots
+- `/ls [path]`: list files from the current or specified directory
+- `/cd <path>`: change the current directory for this chat binding
+- `/launch <backend> <bot> <workdir>`: launch a worker in tmux
+
+Worker frontend:
+
+- `/help`: show help
+- `/status`: show worker status
 - `/stop`: stop the current request
+- non-command text: submit a prompt to the attached worker session
 
 ## Notes
 
-- Session state is stored in `codex-bot-state.json` by default.
-- `/new` and `/switch` are generation-guarded so an older cancelled run cannot overwrite a newer session selection.
-- `/remove` performs a full local cleanup: transcript files, `session_index.jsonl`, `history.jsonl`, and matching thread rows in the latest `state_*.sqlite`.
-- `/usage` reads `auth.json` from the same Codex home the bridge uses and calls the Codex usage endpoint directly.
-- `/add-account` and `/login` are restricted to private chats because device codes are sensitive.
+- RPC sockets are created under the configured `rpc.socket_dir`.
+- The daemon is a small control plane: it lists live workers, lists bots, browses the filesystem, and launches workers.
+- Worker inventory is derived from live processes, not a persisted daemon state store.
+- Worker bots come from `telegram.worker_tokens`; the manager bot uses `telegram.manager_token`.
 - Codex event parsing is intentionally tolerant of missing or drifting JSON fields to avoid the crash pattern seen in the original Go bridge.
